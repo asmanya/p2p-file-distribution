@@ -1,0 +1,35 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.exe~
+*.test
+*.out
+
+# Go tooling
+*.prof
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local, untracked scratch files (e.g. downloaded .torrent/test files during manual testing)
+*.torrent
+!testdata/**/*.torrent
+*.iso
+*.img
+downloads/
+out/
+
+# Env / local config
+.env
+
+# Project-internal, not for the repo
+docs/planning/
+
+# Generated files
+coverage.out
+coverage.html
+
