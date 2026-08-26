@@ -39,3 +39,59 @@ func TestDecodeInteger(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeByteString(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    ByteString
+		wantErr bool
+	}{
+		{"basic", "4:spam", "spam", false},
+		{"empty", "0:", "", false},
+		{"truncated", "3:ab", "", true},
+		{"negative length", "-1:x", "", true},
+		{"limit exceeded", "99999999999:x", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewDecoder(strings.NewReader(tt.input))
+			v, err := d.Decode()
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("input %q: got nil error, want error", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("input %q: unexpected error %v", tt.input, err)
+			}
+			bs, err := AsByteString(v)
+			if err != nil || bs != tt.want {
+				t.Errorf("input %q: got (%v, %v), want %v", tt.input, bs, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecodeByteStringRawBinary(t *testing.T) {
+	raw := make([]byte, 20)
+	for i := range raw {
+		raw[i] = byte(i * 13) // non-UTF-8-safe bytes, like a real piece hash
+	}
+	input := "20:" + string(raw)
+
+	d := NewDecoder(strings.NewReader(input))
+	v, err := d.Decode()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	
+	bs, err := AsByteString(v)
+	if err != nil {
+		t.Fatalf("AsByteString: %v", err)
+	}
+	if string(bs) != string(raw) {
+		t.Errorf("bytes not preserved exactly: got %v, want %v", []byte(bs), raw)
+	}
+}

@@ -24,13 +24,13 @@ func (d *Decoder) Decode() (Value, error) {
 	}
 	switch {
 	case b[0] == 'i':
-		return d.decodeInteger()
+		return d.decodeInteger() // integer
 	case b[0] == 'l':
 		return nil, ErrInvalidTypeMarker // list (for now)
 	case b[0] == 'd':
 		return nil, ErrInvalidTypeMarker // dict (for now)
 	case b[0] >= '0' && b[0] <= '9':
-		return nil, ErrInvalidTypeMarker // byte string (for now)
+		return d.decodeByteString() // byte string
 	default:
 		return nil, ErrInvalidTypeMarker
 	}
@@ -83,4 +83,29 @@ func validateIntegerString(s string) error {
 		}
 	}
 	return nil
+}
+
+// Bytestring Decoder
+func (d *Decoder) decodeByteString() (ByteString, error) {
+	lenStr, err := d.r.ReadString(':')
+	if err != nil {
+		return "", ErrUnexpectedEOF
+	}
+	lenStr = lenStr[:len(lenStr)-1] // drop trailing ':'
+
+	length, err := strconv.ParseInt(lenStr, 10, 64)
+	if err != nil || length < 0 {
+		return "", ErrInvalidStringLen
+	}
+
+	if length > MaxStringLength {
+		return "", ErrLimitExceeded // checked BEFORE allocating
+	}
+
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(d.r, buf); err != nil {
+		return "", ErrUnexpectedEOF
+	}
+
+	return ByteString(buf), nil
 }
