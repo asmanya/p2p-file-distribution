@@ -12,4 +12,5 @@ var (
 	ErrUnsortedKeys      = errors.New("bencode: dictionary keys not sorted or duplicated")
 	ErrTrailingData      = errors.New("bencode: trailing data after top-level value")
 	ErrTypeMismatch      = errors.New("bencode: type mismatch")
+	ErrKeyNotFound       = errors.New("bencode: dictionary key not found")
 )
