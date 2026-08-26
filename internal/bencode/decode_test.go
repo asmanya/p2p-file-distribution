@@ -86,7 +86,7 @@ func TestDecodeByteStringRawBinary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	
+
 	bs, err := AsByteString(v)
 	if err != nil {
 		t.Fatalf("AsByteString: %v", err)
