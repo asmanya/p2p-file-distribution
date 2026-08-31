@@ -5,10 +5,11 @@ A BitTorrent v1 client, implemented from the protocol specification in Go, with 
 [![CI](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml/badge.svg)](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml)
 
 **Status:** actively in development. The bencode codec (the serialization
-format `.torrent` files and tracker responses use) is done — both decoding
-and canonical encoding — and survives malformed or hostile input without
-panicking. Still to come: `.torrent`/metainfo parsing, the tracker client,
-and the peer wire protocol.
+format `.torrent` files and tracker responses use) is done. `.torrent`
+metainfo parsing is underway: torrent files parse into a validated, typed
+struct, including a check that rejects any filename attempting path
+traversal. Still to come: info-hash computation, the tracker client, and
+the peer wire protocol.
 
 ## Demo
 
@@ -66,6 +67,28 @@ Full rationale: `docs/architecture.md`.
   re-encoding a dictionary into the exact same canonical bytes every time.
   Get either side wrong and the symptom shows up as a confusing hash
   mismatch, layers away from the actual bug.
+- **A parsed `.torrent` file is its own struct, not the raw bencode tree
+  wearing a different hat.** The two are related but distinct: the bencode
+  tree is a generic, nested value; the application struct is flat, typed,
+  and specific to what a torrent actually needs. One explicit parsing step
+  connects them, so the messy, general-purpose shape never leaks into the
+  rest of the client.
+- **Multi-file support is designed in now, even though only single-file
+  torrents are implemented.** The struct already models a torrent as a
+  list of files — a single-file torrent is just a list with one entry.
+  Adding real multi-file support later means extending that list, not
+  rewriting every piece of code that assumed exactly one file.
+- **A torrent's filename is treated as untrusted input, because it is.**
+  It comes from a `.torrent` file anyone could have authored. Before it's
+  used for anything, it's checked against path separators, `..`
+  components, leading dots, and absolute paths — rejecting anything that
+  isn't a plain, safe filename. Without this, a malicious torrent could
+  use a name like `../../.ssh/authorized_keys` to write outside the
+  intended download directory.
+- **Piece count is cross-checked against total length and piece length on
+  parse, not taken on faith from the file.** A `.torrent` file that claims
+  an inconsistent piece count is corrupt or malicious, and is rejected
+  immediately rather than causing confusing failures much later.
 
 ## Performance
 
@@ -87,6 +110,10 @@ The decoder is also fuzz-tested: a native Go fuzz target runs it against
 random and mutated input, seeded with every known-valid and known-malformed
 case above, asserting it never panics and that anything it successfully
 decodes survives an encode/decode round trip unchanged.
+
+Metainfo parsing is checked against real `.torrent` fixtures with known,
+independently-verified values, and against a battery of malicious filename
+inputs to confirm the path-traversal check actually rejects all of them.
 
 All tests run under the race detector (`make race`).
 
