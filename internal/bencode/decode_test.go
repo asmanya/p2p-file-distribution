@@ -1,6 +1,8 @@
 package bencode
 
 import (
+	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -93,5 +95,88 @@ func TestDecodeByteStringRawBinary(t *testing.T) {
 	}
 	if string(bs) != string(raw) {
 		t.Errorf("bytes not preserved exactly: got %v, want %v", []byte(bs), raw)
+	}
+}
+
+func TestDecodeList(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    List
+		wantErr bool
+	}{
+		{"empty", "le", List{}, false},
+		{"basic", "l4:spami42ee", List{ByteString("spam"), Integer(42)}, false},
+		{"nested", "ll4:spamee", List{List{ByteString("spam")}}, false},
+		{"unterminated", "l4:spam", nil, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewDecoder(strings.NewReader(tt.input))
+			v, err := d.Decode()
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("got nil error, wanted error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			l, err := AsList(v)
+			if err != nil {
+				t.Fatalf("AsList: %v", err)
+			}
+			if !reflect.DeepEqual(l, tt.want) {
+				t.Errorf("got %#v, want %#v", l, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecodeDictionary(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    Dictionary
+		wantErr error
+	}{
+		{"empty", "de", Dictionary{}, nil},
+		{"basic", "d3:bar4:spam3:fooi42ee", Dictionary{"bar": ByteString("spam"), "foo": Integer(42)}, nil},
+		{"unsorted", "d3:foo3:bar3:abc3:xyze", nil, ErrUnsortedKeys},
+		{"duplicate", "d3:foo3:bar3:foo3:baze", nil, ErrUnsortedKeys},
+		{"non-string key", "di42e3:fooe", nil, ErrNonStringKey},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewDecoder(strings.NewReader(tt.input))
+			v, err := d.Decode()
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Errorf("got %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			dict, err := AsDictionary(v)
+			if err != nil {
+				t.Fatalf("AsDictionary: %v", err)
+			}
+			if !reflect.DeepEqual(dict, tt.want) {
+				t.Errorf("got %#v, want %#v", dict, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecodeDepthLimit(t *testing.T) {
+	input := strings.Repeat("l", MaxNestingDepth+1) + strings.Repeat("e", MaxNestingDepth+1)
+	d := NewDecoder(strings.NewReader(input))
+
+	if _, err := d.Decode(); !errors.Is(err, ErrLimitExceeded) {
+		t.Errorf("got %v, want ErrLimitExceeded", err)
 	}
 }

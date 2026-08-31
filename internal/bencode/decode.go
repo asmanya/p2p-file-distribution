@@ -8,7 +8,8 @@ import (
 
 // Decoder decodes bencode values from a stream.
 type Decoder struct {
-	r *bufio.Reader
+	r     *bufio.Reader
+	depth int
 }
 
 // NewDecoder returns a Decoder that reads from r.
@@ -18,6 +19,10 @@ func NewDecoder(r io.Reader) *Decoder {
 
 // Decode reads and returns the next bencode Value from the stream.
 func (d *Decoder) Decode() (Value, error) {
+	return d.decodeValue()
+}
+
+func (d *Decoder) decodeValue() (Value, error) {
 	b, err := d.r.Peek(1)
 	if err != nil {
 		return nil, ErrUnexpectedEOF
@@ -26,9 +31,9 @@ func (d *Decoder) Decode() (Value, error) {
 	case b[0] == 'i':
 		return d.decodeInteger() // integer
 	case b[0] == 'l':
-		return nil, ErrInvalidTypeMarker // list (for now)
+		return d.decodeList() // list
 	case b[0] == 'd':
-		return nil, ErrInvalidTypeMarker // dict (for now)
+		return d.decodeDictionary() // dict
 	case b[0] >= '0' && b[0] <= '9':
 		return d.decodeByteString() // byte string
 	default:
@@ -108,4 +113,86 @@ func (d *Decoder) decodeByteString() (ByteString, error) {
 	}
 
 	return ByteString(buf), nil
+}
+
+// List decode
+func (d *Decoder) decodeList() (List, error) {
+	if _, err := d.r.ReadByte(); err != nil { // cosume 'l'
+		return nil, ErrUnexpectedEOF
+	}
+
+	d.depth++
+	defer func() { d.depth-- }()
+	if d.depth > MaxNestingDepth {
+		return nil, ErrLimitExceeded
+	}
+
+	list := List{}
+	for {
+		b, err := d.r.Peek(1)
+		if err != nil {
+			return nil, ErrUnexpectedEOF // unterminated
+		}
+		if b[0] == 'e' {
+			_, _ = d.r.ReadByte()
+			return list, nil
+		}
+		v, err := d.decodeValue()
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, v)
+	}
+}
+
+// dictionary decode
+func (d *Decoder) decodeDictionary() (Dictionary, error) {
+	if _, err := d.r.ReadByte(); err != nil { // consume 'd'
+		return nil, ErrUnexpectedEOF
+	}
+
+	d.depth++
+	defer func() { d.depth-- }()
+	if d.depth > MaxNestingDepth {
+		return nil, ErrLimitExceeded
+	}
+
+	dict := Dictionary{}
+	var prevKey string
+	first := true
+
+	for {
+		b, err := d.r.Peek(1)
+		if err != nil {
+			return nil, ErrUnexpectedEOF
+		}
+		if b[0] == 'e' {
+			_, _ = d.r.ReadByte()
+			return dict, nil
+		}
+
+		keyVal, err := d.decodeValue()
+		if err != nil {
+			return nil, err
+		}
+
+		keyBS, ok := keyVal.(ByteString)
+		if !ok {
+			return nil, ErrNonStringKey
+		}
+		key := string(keyBS)
+
+		if !first && key <= prevKey {
+			return nil, ErrUnsortedKeys // catches unsorted AND duplicate
+		}
+		first = false
+		prevKey = key
+
+		value, err := d.decodeValue()
+		if err != nil {
+			return nil, err
+		}
+
+		dict[key] = value
+	}
 }
