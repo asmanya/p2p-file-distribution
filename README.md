@@ -4,12 +4,11 @@ A BitTorrent v1 client, implemented from the protocol specification in Go, with 
 
 [![CI](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml/badge.svg)](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml)
 
-**Status:** actively in development. The bencode codec (the serialization
-format `.torrent` files and tracker responses use) is done. `.torrent`
-metainfo parsing is underway: torrent files parse into a validated, typed
-struct, including a check that rejects any filename attempting path
-traversal. Still to come: info-hash computation, the tracker client, and
-the peer wire protocol.
+**Status:** actively in development. The bencode codec and `.torrent`
+metainfo parsing are both done — a `.torrent` file parses into a
+validated, typed struct, and its info hash (the 20 bytes that identify it
+to trackers and peers) is computed two independent ways and cross-checked.
+Still to come: the tracker client and the peer wire protocol.
 
 ## Demo
 
@@ -39,56 +38,52 @@ Full rationale: `docs/architecture.md`.
 ## Design decisions
 
 - **The bencode codec is hand-written, not pulled from a library.** Zero
-  third-party runtime dependencies is a hard constraint for this project,
-  and bencode is small enough to fully own — which also means every byte
-  of the format the rest of the client depends on is something I can
-  actually explain, not just import.
+  third-party runtime dependencies is a hard constraint here, and bencode
+  is small enough to fully own — every byte of the format the rest of the
+  client depends on is something I can explain, not just import.
 - **No reflection, no struct tags.** Decoding builds an explicit `Value`
   interface with four concrete types instead of unmarshaling into
-  arbitrary Go structs. It's more typing up front, but the type system
-  catches mistakes that a reflection-based decoder would only surface at
-  runtime, if at all.
+  arbitrary structs. The type system catches mistakes a reflection-based
+  decoder would only surface at runtime, if at all.
 - **The `Value` interface is sealed** via an unexported marker method, so
-  only this package's four types (byte string, integer, list, dictionary)
-  can ever satisfy it — type switches on `Value` stay exhaustive everywhere
-  else in the codebase, with no risk of a silently-unhandled fifth case.
-- **Size and depth guards are checked before allocating or recursing, never
-  after.** A string length is validated against a fixed cap before any
-  buffer is created; nesting depth is checked before any recursive call.
-  A hostile multi-gigabyte length prefix, or a few thousand nested lists,
-  is rejected for free, before it costs any memory or stack space.
-- **Byte strings are treated as opaque bytes, never as text.** The decoder
-  never validates or normalizes them as UTF-8, since piece hashes are raw
-  binary — any implicit text handling here would silently corrupt every
-  hash later in the pipeline.
-- **Dictionary keys must be strictly ascending on decode, and are sorted by
-  plain byte comparison (never locale-aware) on encode.** Both sides of
-  this exist for the same reason: the info-hash computation depends on
-  re-encoding a dictionary into the exact same canonical bytes every time.
-  Get either side wrong and the symptom shows up as a confusing hash
-  mismatch, layers away from the actual bug.
+  only four types can ever satisfy it — type switches on `Value` stay
+  exhaustive everywhere, with no risk of a silently-unhandled fifth case.
+- **Size and depth guards run before allocating or recursing, never
+  after.** A hostile multi-gigabyte length prefix, or thousands of nested
+  lists, is rejected before it costs any memory or stack space.
+- **Byte strings are opaque bytes, never text.** The decoder never
+  validates or normalizes them as UTF-8, since piece hashes are raw binary
+  — any implicit text handling would silently corrupt them.
+- **Dictionary keys are strictly ascending on decode, and byte-wise sorted
+  on encode.** Both exist for one reason: the info-hash computation
+  depends on re-encoding a dictionary into the exact same bytes every
+  time. Get either side wrong and the symptom is a hash mismatch, layers
+  away from the actual bug.
 - **A parsed `.torrent` file is its own struct, not the raw bencode tree
-  wearing a different hat.** The two are related but distinct: the bencode
-  tree is a generic, nested value; the application struct is flat, typed,
-  and specific to what a torrent actually needs. One explicit parsing step
-  connects them, so the messy, general-purpose shape never leaks into the
-  rest of the client.
-- **Multi-file support is designed in now, even though only single-file
+  wearing a different hat.** One explicit parsing step connects the two,
+  so bencode's generic, nested shape never leaks into the rest of the
+  client.
+- **Multi-file support is designed in now, though only single-file
   torrents are implemented.** The struct already models a torrent as a
-  list of files — a single-file torrent is just a list with one entry.
-  Adding real multi-file support later means extending that list, not
-  rewriting every piece of code that assumed exactly one file.
+  list of files; a single-file torrent is just a list with one entry.
+  Real multi-file support later extends that list instead of rewriting
+  every consumer that assumed exactly one file.
 - **A torrent's filename is treated as untrusted input, because it is.**
-  It comes from a `.torrent` file anyone could have authored. Before it's
-  used for anything, it's checked against path separators, `..`
-  components, leading dots, and absolute paths — rejecting anything that
-  isn't a plain, safe filename. Without this, a malicious torrent could
-  use a name like `../../.ssh/authorized_keys` to write outside the
-  intended download directory.
+  It's checked against path separators, `..` components, leading dots,
+  and absolute paths before use — rejecting anything that isn't a plain,
+  safe filename. Without this, a malicious torrent could use a name like
+  `../../.ssh/authorized_keys` to write outside the download directory.
 - **Piece count is cross-checked against total length and piece length on
-  parse, not taken on faith from the file.** A `.torrent` file that claims
-  an inconsistent piece count is corrupt or malicious, and is rejected
-  immediately rather than causing confusing failures much later.
+  parse, not taken on faith.** An inconsistent claim means the file is
+  corrupt or malicious, and is rejected immediately instead of causing a
+  confusing failure much later.
+- **The info hash is computed two independent ways and cross-checked**:
+  once by re-encoding the parsed `info` dictionary canonically, and once
+  by hashing the dictionary's original raw bytes directly (tracked via
+  byte offsets recorded during decoding). Agreement between the two is
+  what makes the first method's correctness a verified fact rather than
+  an assumption — and keeps the door open to relaxing strict key-ordering
+  later without ever risking a silently wrong hash.
 
 ## Performance
 
@@ -111,9 +106,12 @@ random and mutated input, seeded with every known-valid and known-malformed
 case above, asserting it never panics and that anything it successfully
 decodes survives an encode/decode round trip unchanged.
 
-Metainfo parsing is checked against real `.torrent` fixtures with known,
-independently-verified values, and against a battery of malicious filename
-inputs to confirm the path-traversal check actually rejects all of them.
+Metainfo parsing is checked against both real `.torrent` fixtures and a
+battery of malicious filename inputs, confirming the path-traversal check
+rejects all of them. A golden test then asserts every parsed field — info
+hash, announce URL, piece geometry, total length, name — against
+ground-truth values recorded independently (via `transmission-show`, not
+this project's own code) for both fixtures.
 
 All tests run under the race detector (`make race`).
 
