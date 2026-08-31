@@ -53,8 +53,11 @@ Full rationale: `docs/architecture.md`.
 Table-driven tests cover the bencode decoder's edge cases — malformed
 integers, truncated/oversized byte strings, unterminated and deeply nested
 lists/dictionaries, out-of-order and duplicate keys — plus a dedicated test
-confirming raw non-UTF-8 binary data survives decoding untouched. All tests
-run under the race detector (`make race`).
+confirming raw non-UTF-8 binary data survives decoding untouched. Round-trip
+tests decode and re-encode two real `.torrent` files (including a full
+Debian installer image) and assert the output is byte-for-byte identical to
+the original — the actual guarantee the info-hash computation relies on.
+All tests run under the race detector (`make race`).
 
 ## What I'd do differently
 
