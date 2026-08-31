@@ -4,11 +4,11 @@ A BitTorrent v1 client, implemented from the protocol specification in Go, with 
 
 [![CI](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml/badge.svg)](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml)
 
-**Status:** actively in development. The bencode decoder (the serialization
-format `.torrent` files and tracker responses use) handles all four bencode
-types and survives malformed or hostile input without panicking. Still to
-come: the encoder, `.torrent`/metainfo parsing, the tracker client, and the
-peer wire protocol.
+**Status:** actively in development. The bencode codec (the serialization
+format `.torrent` files and tracker responses use) is done — both decoding
+and canonical encoding — and survives malformed or hostile input without
+panicking. Still to come: `.torrent`/metainfo parsing, the tracker client,
+and the peer wire protocol.
 
 ## Demo
 
@@ -42,6 +42,7 @@ Full rationale: `docs/architecture.md`.
 - **Bencode byte strings are treated as opaque bytes, never as text.** The decoder never validates or normalizes them as UTF-8, since piece hashes are raw binary — any implicit text handling here would silently corrupt every hash later in the pipeline.
 - **Recursive decoding (lists, dictionaries) is bounded by an explicit depth counter.** Without it, a pathological input like `llllll...` would recurse until the call stack overflows — an unrecoverable crash in Go, not a catchable error.
 - **Dictionary keys must be strictly ascending, or decoding fails.** Bencode's spec requires sorted keys; rejecting anything else outright means a malformed or corrupted `.torrent` file fails loudly right where the bad data is, instead of surfacing as a confusing hash mismatch several layers away.
+- **The encoder sorts dictionary keys with plain byte-wise comparison, never a locale-aware or case-insensitive one.** This is the property the info-hash computation depends on entirely — get it wrong and the hash silently mismatches, with the real bug several layers removed from the symptom.
 
 ## Performance
 
