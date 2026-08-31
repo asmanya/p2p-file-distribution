@@ -10,6 +10,12 @@ import (
 type Decoder struct {
 	r     *bufio.Reader
 	depth int
+	pos   int64
+}
+
+// Span is a byte range [start, end) within the original input the Decoder read from.
+type Span struct {
+	Start, End int64
 }
 
 // NewDecoder returns a Decoder that reads from r.
@@ -43,11 +49,11 @@ func (d *Decoder) decodeValue() (Value, error) {
 
 // Integer decoder
 func (d *Decoder) decodeInteger() (Integer, error) {
-	if _, err := d.r.ReadByte(); err != nil { // consume 'i'
+	if _, err := d.readByte(); err != nil { // consume 'i'
 		return 0, ErrUnexpectedEOF
 	}
 
-	s, err := d.r.ReadString('e')
+	s, err := d.readString('e')
 	if err != nil {
 		return 0, ErrUnexpectedEOF // no closing 'e' found — truncated
 	}
@@ -92,7 +98,7 @@ func validateIntegerString(s string) error {
 
 // Bytestring Decoder
 func (d *Decoder) decodeByteString() (ByteString, error) {
-	lenStr, err := d.r.ReadString(':')
+	lenStr, err := d.readString(':')
 	if err != nil {
 		return "", ErrUnexpectedEOF
 	}
@@ -108,7 +114,7 @@ func (d *Decoder) decodeByteString() (ByteString, error) {
 	}
 
 	buf := make([]byte, length)
-	if _, err := io.ReadFull(d.r, buf); err != nil {
+	if err := d.readFull(buf); err != nil {
 		return "", ErrUnexpectedEOF
 	}
 
@@ -117,7 +123,7 @@ func (d *Decoder) decodeByteString() (ByteString, error) {
 
 // List decode
 func (d *Decoder) decodeList() (List, error) {
-	if _, err := d.r.ReadByte(); err != nil { // cosume 'l'
+	if _, err := d.readByte(); err != nil { // cosume 'l'
 		return nil, ErrUnexpectedEOF
 	}
 
@@ -134,7 +140,7 @@ func (d *Decoder) decodeList() (List, error) {
 			return nil, ErrUnexpectedEOF // unterminated
 		}
 		if b[0] == 'e' {
-			_, _ = d.r.ReadByte()
+			_, _ = d.readByte()
 			return list, nil
 		}
 		v, err := d.decodeValue()
@@ -147,7 +153,7 @@ func (d *Decoder) decodeList() (List, error) {
 
 // dictionary decode
 func (d *Decoder) decodeDictionary() (Dictionary, error) {
-	if _, err := d.r.ReadByte(); err != nil { // consume 'd'
+	if _, err := d.readByte(); err != nil { // consume 'd'
 		return nil, ErrUnexpectedEOF
 	}
 
@@ -167,7 +173,7 @@ func (d *Decoder) decodeDictionary() (Dictionary, error) {
 			return nil, ErrUnexpectedEOF
 		}
 		if b[0] == 'e' {
-			_, _ = d.r.ReadByte()
+			_, _ = d.readByte()
 			return dict, nil
 		}
 
@@ -210,4 +216,97 @@ func DecodeStrict(r io.Reader) (Value, error) {
 		return nil, ErrTrailingData // more bytes exist after the value
 	}
 	return v, nil
+}
+
+// readByte, readString and readFull wrap the underlying reader's consuming operations, tracking exactly how many
+// bytes have been consumed so far - needed for span recording. Peek is unaffected since it doesn't consume anything.
+func (d *Decoder) readByte() (byte, error) {
+	b, err := d.r.ReadByte()
+	if err == nil {
+		d.pos++
+	}
+	return b, err
+}
+
+func (d *Decoder) readString(delim byte) (string, error) {
+	s, err := d.r.ReadString(delim)
+	d.pos += int64(len(s))
+	return s, err
+}
+
+func (d *Decoder) readFull(buf []byte) error {
+	n, err := io.ReadFull(d.r, buf)
+	d.pos += int64(n)
+	return err
+}
+
+func (d *Decoder) decodeDictionaryWithSpans() (Dictionary, map[string]Span, error) {
+	if _, err := d.readByte(); err != nil { // consume 'd'
+		return nil, nil, ErrUnexpectedEOF
+	}
+	d.depth++
+	defer func() { d.depth-- }()
+	if d.depth > MaxNestingDepth {
+		return nil, nil, ErrLimitExceeded
+	}
+
+	dict := Dictionary{}
+	spans := map[string]Span{}
+	var prevKey string
+	first := true
+
+	for {
+		b, err := d.r.Peek(1)
+		if err != nil {
+			return nil, nil, ErrUnexpectedEOF
+		}
+		if b[0] == 'e' {
+			_, _ = d.readByte()
+			return dict, spans, nil
+		}
+
+		keyVal, err := d.decodeValue()
+		if err != nil {
+			return nil, nil, err
+		}
+		keyBS, ok := keyVal.(ByteString)
+		if !ok {
+			return nil, nil, ErrNonStringKey
+		}
+		key := string(keyBS)
+		if !first && key <= prevKey {
+			return nil, nil, ErrUnsortedKeys
+		}
+		first = false
+		prevKey = key
+
+		start := d.pos
+		value, err := d.decodeValue()
+		if err != nil {
+			return nil, nil, err
+		}
+		spans[key] = Span{Start: start, End: d.pos}
+		dict[key] = value
+	}
+}
+
+// DecodeWithSpans decodes a top-level bencode dictionary and also returns
+// the exact byte range each key's value occupied in the original input —
+// so a caller can hash the original bytes of one value directly, instead
+// of a re-encoded copy of it.
+func (d *Decoder) DecodeWithSpans() (Dictionary, map[string]Span, error) {
+	b, err := d.r.Peek(1)
+	if err != nil {
+		return nil, nil, ErrUnexpectedEOF
+	}
+	if b[0] != 'd' {
+		return nil, nil, ErrInvalidTypeMarker
+	}
+	return d.decodeDictionaryWithSpans()
+}
+
+// AtEnd reports whether there is no more data left to read.
+func (d *Decoder) AtEnd() bool {
+	_, err := d.r.Peek(1)
+	return err != nil
 }
