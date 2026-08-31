@@ -35,4 +35,38 @@ it — a goroutine or a mutex, never ambiguous)*
 
 ## Design notes
 
-*(placeholder — expanded as architectural decisions are made)*
+### internal/bencode
+
+The lowest layer: bencode serialization, with no awareness of torrents,
+pieces, or peers. Every other package's correctness eventually rests on
+this one being both exhaustively type-safe and hostile-input-safe, since
+`.torrent` files and tracker responses are the first untrusted data the
+client ever touches.
+
+- **Sealed `Value` interface.** The four concrete types (`ByteString`,
+  `Integer`, `List`, `Dictionary`) satisfy `Value` through an unexported
+  marker method, so no other package can add a fifth. Every type switch on
+  `Value` elsewhere in the codebase can stay exhaustive without a `default`
+  case masking a missed type — chosen deliberately over a reflection-based
+  decoder, which would push that same class of mistake to runtime instead
+  of the compiler.
+- **Guards are checked before allocation, not after.** A string length or
+  nesting depth is validated against a fixed cap before any buffer is
+  created or any recursive call is made — an oversized length prefix or a
+  deeply nested input is rejected for free, with no memory or stack cost.
+- **Byte strings are opaque bytes, never text.** The decoder performs no
+  UTF-8 validation or normalization, since piece hashes are raw binary; any
+  implicit text handling would silently corrupt them.
+- **Dictionary keys are strictly ascending on decode, and byte-wise sorted
+  (never locale-aware) on encode.** Both sides of this are load-bearing:
+  encoding must produce a canonical byte sequence for the info-hash
+  computation to be reproducible, and decoding must reject anything that
+  doesn't already satisfy that canonical form, so a malformed input fails
+  where it occurs instead of as a mysterious hash mismatch elsewhere.
+- **Round-trip and fuzz tests are the actual proof, not the unit tests.**
+  Decoding and re-encoding both real `.torrent` fixtures byte-for-byte
+  demonstrates the encoder is canonical and the decoder lossless — which is
+  exactly what the info-hash computation depends on. A native Go fuzz
+  target, seeded from every known edge case, then checks the same
+  decode/encode pair holds under random and mutated input, and that
+  malformed input always fails as an error, never a panic.

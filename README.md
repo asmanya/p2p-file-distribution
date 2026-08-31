@@ -37,12 +37,35 @@ Full rationale: `docs/architecture.md`.
 
 ## Design decisions
 
-- **The bencode `Value` interface is sealed** via an unexported marker method, so only this package's four types (byte string, integer, list, dictionary) can ever satisfy it — type switches on `Value` stay exhaustive everywhere else in the codebase.
-- **Size guards are checked before allocating**, never after. A length prefix is validated against a fixed cap first; only then is a buffer of that size created — so a hostile "allocate a terabyte" length claim is rejected for free, before any memory is touched.
-- **Bencode byte strings are treated as opaque bytes, never as text.** The decoder never validates or normalizes them as UTF-8, since piece hashes are raw binary — any implicit text handling here would silently corrupt every hash later in the pipeline.
-- **Recursive decoding (lists, dictionaries) is bounded by an explicit depth counter.** Without it, a pathological input like `llllll...` would recurse until the call stack overflows — an unrecoverable crash in Go, not a catchable error.
-- **Dictionary keys must be strictly ascending, or decoding fails.** Bencode's spec requires sorted keys; rejecting anything else outright means a malformed or corrupted `.torrent` file fails loudly right where the bad data is, instead of surfacing as a confusing hash mismatch several layers away.
-- **The encoder sorts dictionary keys with plain byte-wise comparison, never a locale-aware or case-insensitive one.** This is the property the info-hash computation depends on entirely — get it wrong and the hash silently mismatches, with the real bug several layers removed from the symptom.
+- **The bencode codec is hand-written, not pulled from a library.** Zero
+  third-party runtime dependencies is a hard constraint for this project,
+  and bencode is small enough to fully own — which also means every byte
+  of the format the rest of the client depends on is something I can
+  actually explain, not just import.
+- **No reflection, no struct tags.** Decoding builds an explicit `Value`
+  interface with four concrete types instead of unmarshaling into
+  arbitrary Go structs. It's more typing up front, but the type system
+  catches mistakes that a reflection-based decoder would only surface at
+  runtime, if at all.
+- **The `Value` interface is sealed** via an unexported marker method, so
+  only this package's four types (byte string, integer, list, dictionary)
+  can ever satisfy it — type switches on `Value` stay exhaustive everywhere
+  else in the codebase, with no risk of a silently-unhandled fifth case.
+- **Size and depth guards are checked before allocating or recursing, never
+  after.** A string length is validated against a fixed cap before any
+  buffer is created; nesting depth is checked before any recursive call.
+  A hostile multi-gigabyte length prefix, or a few thousand nested lists,
+  is rejected for free, before it costs any memory or stack space.
+- **Byte strings are treated as opaque bytes, never as text.** The decoder
+  never validates or normalizes them as UTF-8, since piece hashes are raw
+  binary — any implicit text handling here would silently corrupt every
+  hash later in the pipeline.
+- **Dictionary keys must be strictly ascending on decode, and are sorted by
+  plain byte comparison (never locale-aware) on encode.** Both sides of
+  this exist for the same reason: the info-hash computation depends on
+  re-encoding a dictionary into the exact same canonical bytes every time.
+  Get either side wrong and the symptom shows up as a confusing hash
+  mismatch, layers away from the actual bug.
 
 ## Performance
 
@@ -53,10 +76,18 @@ Full rationale: `docs/architecture.md`.
 Table-driven tests cover the bencode decoder's edge cases — malformed
 integers, truncated/oversized byte strings, unterminated and deeply nested
 lists/dictionaries, out-of-order and duplicate keys — plus a dedicated test
-confirming raw non-UTF-8 binary data survives decoding untouched. Round-trip
-tests decode and re-encode two real `.torrent` files (including a full
-Debian installer image) and assert the output is byte-for-byte identical to
-the original — the actual guarantee the info-hash computation relies on.
+confirming raw non-UTF-8 binary data survives decoding untouched.
+
+Round-trip tests decode and re-encode two real `.torrent` files (including
+a full Debian installer image) and assert the output is byte-for-byte
+identical to the original — the actual guarantee the info-hash computation
+relies on.
+
+The decoder is also fuzz-tested: a native Go fuzz target runs it against
+random and mutated input, seeded with every known-valid and known-malformed
+case above, asserting it never panics and that anything it successfully
+decodes survives an encode/decode round trip unchanged.
+
 All tests run under the race detector (`make race`).
 
 ## What I'd do differently
