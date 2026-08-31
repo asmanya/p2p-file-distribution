@@ -2,6 +2,7 @@ package metainfo
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"os"
@@ -23,21 +24,20 @@ func ParseFile(path string) (*Torrent, error) {
 
 // Parse decodes .torrent file bytes into a Torrent.
 func Parse(data []byte) (*Torrent, error) {
-	v, err := bencode.DecodeStrict(bytes.NewReader(data))
+	d := bencode.NewDecoder(bytes.NewReader(data))
+	root, spans, err := d.DecodeWithSpans()
 	if err != nil {
 		return nil, fmt.Errorf("metainfo: decode: %w", err)
 	}
-
-	root, err := bencode.AsDictionary(v)
-	if err != nil {
-		return nil, fmt.Errorf("metainfo: top-level value is not a dictionary: %w", err)
+	if !d.AtEnd() {
+		return nil, fmt.Errorf("metainfo: %w", bencode.ErrTrailingData)
 	}
 
 	t := &Torrent{}
 
 	announce, err := root.GetString("announce")
 	if err != nil {
-		return nil, fmt.Errorf("metainfo: missing announce: %w", err)
+		return nil, fmt.Errorf("metainfo: missing announce %w", err)
 	}
 	t.Announce = announce
 
@@ -49,13 +49,20 @@ func Parse(data []byte) (*Torrent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("metainfo: missing info dictionary: %w", err)
 	}
-
 	info, err := bencode.AsDictionary(infoVal)
 	if err != nil {
-		return nil, fmt.Errorf("metainfo: info is not a dictionary: %W", err)
+		return nil, fmt.Errorf("metainfo: info is not a dictionary: %w", err)
 	}
 
-	if err := parseInfo(info, t); err != nil {
+	if err := parseInfo(info, t); err != nil { // Method A hash set here
+		return nil, err
+	}
+
+	infoSpan, ok := spans["info"]
+	if !ok {
+		return nil, fmt.Errorf("metainfo: could not locate info dictionary span")
+	}
+	if err := crossCheckInfoHash(data, infoSpan, t.InfoHash); err != nil {
 		return nil, err
 	}
 
@@ -187,6 +194,18 @@ func validateName(name string) error {
 	}
 	if filepath.IsAbs(name) {
 		return fmt.Errorf("name is an absolute path: %q", name)
+	}
+
+	return nil
+}
+
+// crossCheckInfoHash computes the info hash directly from the original file bytes at span (Method B) and confirms it
+// matches the hash already computed by canonical re-encoding (Method A). Disagreement means the info dictionary in the
+// file wasn't canonically encoded, and Method A's hash can't be trusted.
+func crossCheckInfoHash(data []byte, span bencode.Span, methodA [20]byte) error {
+	methodB := sha1.Sum(data[span.Start:span.End])
+	if methodB != methodA {
+		return fmt.Errorf("metainfo: info hash mismatch between canonical re-encoding and raw bytes")
 	}
 
 	return nil
