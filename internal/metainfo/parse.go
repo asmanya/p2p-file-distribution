@@ -96,6 +96,12 @@ func parseAnnounceList(root bencode.Dictionary, t *Torrent) error {
 }
 
 func parseInfo(info bencode.Dictionary, t *Torrent) error {
+	hash, err := computeInfoHash(info)
+	if err != nil {
+		return fmt.Errorf("metainfo: compute info hash: %w", err)
+	}
+	t.InfoHash = hash
+
 	name, err := info.GetString("name")
 	if err != nil {
 		return fmt.Errorf("metainfo: missing info.name: %w", err)
