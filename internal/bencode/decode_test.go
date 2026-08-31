@@ -180,3 +180,23 @@ func TestDecodeDepthLimit(t *testing.T) {
 		t.Errorf("got %v, want ErrLimitExceeded", err)
 	}
 }
+
+func TestDecodeStrict(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr error
+	}{
+		{"valid, no trailing data", "d3:foo3:bare", nil},
+		{"trailing garbage", "d3:foo3:bareXXXX", ErrTrailingData},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodeStrict(strings.NewReader(tt.input))
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("got %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}

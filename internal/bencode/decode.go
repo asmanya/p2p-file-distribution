@@ -196,3 +196,18 @@ func (d *Decoder) decodeDictionary() (Dictionary, error) {
 		dict[key] = value
 	}
 }
+
+// DecodeStrict reads exactly one bencode value from r and returns ErrTrailingData if
+// any bytes remians afterward. Use this for inputs that must be a single, complete value.
+// e.g. - a .torrent file
+func DecodeStrict(r io.Reader) (Value, error) {
+	d := NewDecoder(r)
+	v, err := d.decodeValue()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := d.r.Peek(1); err == nil {
+		return nil, ErrTrailingData // more bytes exist after the value
+	}
+	return v, nil
+}
