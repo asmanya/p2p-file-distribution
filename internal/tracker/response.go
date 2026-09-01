@@ -45,18 +45,51 @@ func ParseAnnounceResponse(data []byte) (*AnnounceResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tracker: missing peers: %w", err)
 	}
-	peerBS, err := bencode.AsByteString(peersVal)
-	if err != nil {
-		return nil, fmt.Errorf("tracker: legacy peer list not supported: %w", err)
-	}
 
-	peers, err := decodeCompactPeers([]byte(peerBS))
+	var peers []netip.AddrPort
+	switch pv := peersVal.(type) {
+	case bencode.ByteString:
+		peers, err = decodeCompactPeers([]byte(pv))
+	case bencode.List:
+		peers, err = decodeLegacyPeers(pv)
+	default:
+		err = fmt.Errorf("tracker: peers is neither a byte string nor a list")
+	}
 	if err != nil {
 		return nil, err
 	}
 	resp.Peers = peers
 
 	return resp, nil
+}
+
+// decodeLegacyPeers handles the non-compact fallback some trackers still use: a list of dictionaries, each with "ip"
+// and "port" keys.
+func decodeLegacyPeers(list bencode.List) ([]netip.AddrPort, error) {
+	peers := make([]netip.AddrPort, 0, len(list))
+	for _, v := range list {
+		d, err := bencode.AsDictionary(v)
+		if err != nil {
+			return nil, fmt.Errorf("tracker: legacy peer entry is not a dictionary: %w", err)
+		}
+
+		ipStr, err := d.GetString("ip")
+		if err != nil {
+			return nil, fmt.Errorf("tracker: legacy peer missing ip: %w", err)
+		}
+		port, err := d.GetInt("port")
+		if err != nil {
+			return nil, fmt.Errorf("tracker: legacy peer missing port: %w", err)
+		}
+
+		addr, err := netip.ParseAddr(ipStr)
+		if err != nil {
+			return nil, fmt.Errorf("tracker: legacy peer invalid ip %q: %w", ipStr, err)
+		}
+		peers = append(peers, netip.AddrPortFrom(addr, uint16(port)))
+	}
+
+	return peers, nil
 }
 
 // decodeCompactPeers splits a compact peers blob into AddrPorts - each peer is 4 bytes IPv4 address + 2 bytes port,
