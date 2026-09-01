@@ -4,11 +4,11 @@ A BitTorrent v1 client, implemented from the protocol specification in Go, with 
 
 [![CI](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml/badge.svg)](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml)
 
-**Status:** actively in development. The bencode codec and `.torrent`
-metainfo parsing are both done — a `.torrent` file parses into a
-validated, typed struct, and its info hash (the 20 bytes that identify it
-to trackers and peers) is computed two independent ways and cross-checked.
-Still to come: the tracker client and the peer wire protocol.
+**Status:** actively in development. The bencode codec, `.torrent` metainfo
+parsing, and the tracker client are all done. A `.torrent` file parses into
+a validated, typed struct with a cross-checked info hash; the tracker
+client turns that into a live list of peer addresses, verified end-to-end
+against a real public tracker. Still to come: the peer wire protocol.
 
 ## Demo
 
@@ -84,6 +84,25 @@ Full rationale: `docs/architecture.md`.
   what makes the first method's correctness a verified fact rather than
   an assumption — and keeps the door open to relaxing strict key-ordering
   later without ever risking a silently wrong hash.
+- **Peer addresses are `net/netip.AddrPort`, not a hand-rolled struct.**
+  It's comparable and usable as a map key at zero cost — both matter once
+  duplicate peers need to be deduplicated — and it handles IPv4 and IPv6
+  through the same type.
+- **The HTTP client enforces three guards network code almost always
+  forgets**: an explicit request timeout (Go's default client has none —
+  a dead tracker would hang the program forever), a hard cap on how much
+  of the response body gets read (an oversized or malicious body can't
+  exhaust memory), and a status-code check before ever attempting to parse
+  the body (a non-200 response is usually an HTML error page, not bencode).
+- **A tracker announce tries every URL in `announce-list`, in order,
+  before giving up.** Most real-world torrents list a UDP tracker first
+  and an HTTP one further down; skipping unsupported schemes instead of
+  failing outright is the difference between working against real
+  torrents and only working against hand-built test fixtures.
+- **The compact and legacy peer list formats are both handled**, decided
+  by inspecting the actual type of the `peers` value rather than assuming
+  the tracker honored `compact=1`. Real trackers don't always agree with
+  the spec, and the parser has to survive that rather than crash on it.
 
 ## Performance
 
@@ -114,6 +133,15 @@ ground-truth values recorded independently (via `transmission-show`, not
 this project's own code) for both fixtures.
 
 All tests run under the race detector (`make race`).
+
+The tracker client has both unit tests (peer ID generation, announce URL
+encoding against a golden string, compact and legacy peer decoding) and
+integration tests against a local `httptest` server exercising failure
+modes a real tracker can't be relied on to reproduce on demand — a garbage
+body, a non-200 status, a slow response that must trigger the timeout, and
+a body larger than the size cap. It's also been verified against a real
+public tracker (Debian's), which returned a live list of peers for a real
+torrent — the actual proof this layer works outside of tests.
 
 ## What I'd do differently
 

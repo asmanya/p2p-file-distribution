@@ -124,3 +124,54 @@ writes beyond reading the `.torrent` file itself.
   code, for both fixture torrents. This is the one test in the suite that
   can catch a bug this project's own reasoning would reproduce and miss —
   and it should never be deleted.
+
+### internal/tracker
+
+Turns a torrent's announce information into a live list of peer addresses.
+Its only responsibility is *who to talk to* — it never opens a connection
+to a peer itself, and everything network-facing here treats the response
+as hostile until proven otherwise, the same posture `bencode` and
+`metainfo` take toward their own untrusted input.
+
+- **Peer addresses are `net/netip.AddrPort`, not a custom struct.** It's
+  comparable and map-key-able at zero allocation cost, and it represents
+  IPv4 and IPv6 through the same type — both matter once duplicate peers
+  need deduplicating in a later phase.
+- **The peer ID is generated once per session with `crypto/rand`**, using
+  the Azureus-style convention (`-GO0001-` followed by 12 random bytes).
+  It's how a tracker tells this client's connections apart from every
+  other peer's in the swarm; predictability here buys nothing, so the
+  randomness is crypto-grade even though the value isn't a secret.
+- **The info hash and peer ID go into the announce URL as raw bytes,
+  percent-encoded — never as hex.** Go's `net/url` query encoding handles
+  arbitrary byte strings correctly on its own; hex is the common mistake
+  here; it produces a URL that looks plausible and fails against every
+  real tracker, since the tracker sees the wrong 20 bytes entirely.
+- **The tracker's HTTP client carries three guards that all come from the
+  same principle**: treat everything the network hands you as hostile
+  until it's proven otherwise. An explicit timeout (Go's default client
+  has none — a dead tracker hangs the program forever), a hard cap on how
+  much of the response body is read (an oversized or slow-drip body can't
+  exhaust memory), and a status-code check before the body is ever parsed
+  (a non-200 response is usually an HTML error page, not bencode).
+- **Both compact and legacy peer list formats are supported**, chosen by
+  inspecting the actual bencode type of the `peers` value rather than
+  trusting that a tracker honored `compact=1`. Real-world trackers
+  sometimes ignore the request; the parser has to survive that rather
+  than fail on a torrent that would otherwise work fine.
+- **A failed announce to one tracker doesn't fail the whole request.**
+  `announce-list` (BEP-12) is flattened into an ordered list of URLs and
+  tried in order; a URL with an unsupported scheme (UDP trackers are out
+  of scope for this client) or one that errors is skipped, not fatal.
+  This matters in practice — most real torrents list a UDP tracker first,
+  with an HTTP fallback further down the list, so skipping instead of
+  aborting is what makes real torrents work at all.
+- **Integration tests use a local `httptest` server, not a real tracker.**
+  Real trackers are flaky, rate-limit repeated hits, and return a
+  different peer list every time — none of which is reproducible in CI.
+  A local server can deterministically produce failure modes (garbage
+  body, non-200 status, a slow response, an oversized body) that would be
+  impractical to trigger against the real thing on demand. The client was
+  separately verified once against a real public tracker (Debian's),
+  which returned a genuine list of peers for a real torrent — that
+  one-time run is the actual proof this layer works outside of tests.
