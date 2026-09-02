@@ -28,8 +28,12 @@ func TestHandshakeOverSuccess(t *testing.T) {
 		_, _ = ParseHandshake(server)
 		// Reply with a valid handshake carrying the same info hash but a
 		// different peer ID - that's what handshakeOver should return to us.
+		// Deliberately not closing server here: net.Pipe's SetDeadline
+		// errors on either end once the OTHER end is closed, so closing
+		// server immediately would race against handshakeOver's own
+		// deadline-clearing call on client below. client.Close() (deferred)
+		// is enough to release both ends once the test finishes.
 		server.Write((&Handshake{InfoHash: infoHash, PeerID: theirPeerID}).Serialize())
-		server.Close()
 	}()
 
 	conn, err := handshakeOver(client, "test", infoHash, peerID)
