@@ -1,0 +1,64 @@
+package peer
+
+import (
+	"fmt"
+	"net"
+	"time"
+)
+
+const (
+	dialTimeout      = 5 * time.Second // cap on establishing the TCP connection itself
+	handshakeTimeout = 5 * time.Second // cap on the whole handshake exchange, once connected
+)
+
+// Conn wraps an established, handshaken connection to a peer.
+type Conn struct {
+	conn     net.Conn
+	PeerID   [20]byte
+	Reserved [8]byte
+}
+
+// Dial connects to addr, exchanges handshakes, and verifies infoHash matches.
+func Dial(addr string, infoHash, peerID [20]byte) (*Conn, error) {
+	// Bound how long establishing the TCP connection itself can take.
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("peer: dial %s: %w", addr, err)
+	}
+
+	// One deadline covers both the write and the read below - a peer that
+	// accepts the connection and then does nothing must not hang forever.
+	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("peer: set deadline: %w", err)
+	}
+
+	// Send our handshake first.
+	ours := Handshake{InfoHash: infoHash, PeerID: peerID}
+	if _, err := conn.Write(ours.Serialize()); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("peer: send handshake: %w", err)
+	}
+
+	// Then read theirs.
+	theirs, err := ParseHandshake(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("peer: receive handshake: %w", err)
+	}
+
+	// A correct handshake from the wrong torrent is still a failure.
+	if theirs.InfoHash != infoHash {
+		conn.Close()
+		return nil, fmt.Errorf("peer: info hash mismatch")
+	}
+
+	// Handshake is done - clear the deadline so it can't fire mid-download
+	// later. Per-operation deadlines come back in a later phase.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("peer: clear deadline: %w", err)
+	}
+
+	return &Conn{conn: conn, PeerID: theirs.PeerID, Reserved: theirs.Reserved}, nil
+}
