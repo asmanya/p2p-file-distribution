@@ -175,3 +175,63 @@ as hostile until proven otherwise, the same posture `bencode` and
   separately verified once against a real public tracker (Debian's),
   which returned a genuine list of peers for a real torrent — that
   one-time run is the actual proof this layer works outside of tests.
+
+### internal/peer
+
+Implements the BitTorrent wire protocol: pure encoding and decoding of
+handshakes and messages, plus a thin connection layer to exchange them
+over TCP. It has no download policy — deciding which piece to request
+next belongs to the `download` package, not here. This phase covers only
+the handshake; requests, transfer, and choke/unchoke messages arrive in
+later phases on top of the same structure.
+
+- **Serialization and parsing are pure functions, kept completely
+  separate from the network code that uses them.** `Handshake.Serialize`
+  and `ParseHandshake` take and return bytes; neither touches a socket.
+  A wire-format bug shows up as a plain byte-comparison test failure, not
+  as a flaky-looking network test — the same separation `bencode`'s
+  encoder/decoder and `metainfo`'s parser already rely on, applied here
+  for the first time to something a socket carries.
+- **The connection logic is split into a public `Dial` (owns the TCP
+  connection) and an internal `handshakeOver` (owns the handshake
+  exchange over any `net.Conn`).** Production code never sees the split;
+  it exists so tests can hand `handshakeOver` one end of an in-memory
+  `net.Pipe` instead of a real socket, and simulate failure modes — a
+  mismatched info hash, a wrong protocol string, a peer that disconnects
+  mid-handshake, one that never responds at all — that would be
+  impractical to trigger against a real connection on demand.
+- **One deadline covers dial, and a separate one covers the full
+  handshake exchange — write and read both.** A deadline set only before
+  the read would still let a peer that accepts a connection and never
+  reads hang the write, since a full send buffer blocks `Write` too.
+- **The handshake deadline is explicitly cleared the moment the exchange
+  succeeds.** Leaving it in place is the version of this bug that doesn't
+  show up until much later: the same deadline would eventually fire in
+  the middle of unrelated work in a future phase, and look like an
+  unrelated, intermittent failure rather than what it actually is.
+- **Connection-refused, handshake timeout, protocol mismatch, and
+  info-hash mismatch are distinguishable outcomes, not one generic
+  error.** Most addresses a tracker hands back belong to peers that are
+  offline, unreachable, or gone — that's normal, not a bug — and the
+  only way to tell "the swarm is mostly dead right now" from "my
+  handshake code is broken" is if the failure reasons are visible
+  instead of collapsed into one message.
+- **`handshakeTimeout` is a package variable, not a constant, purely so
+  tests can shrink it.** A test proving a slow/silent peer triggers a
+  timeout has to actually wait for the timeout to fire; letting the test
+  override the duration is the difference between that test taking
+  50 milliseconds and it taking 5 seconds for the exact same coverage.
+- **`net.Pipe`'s two ends are not independent of each other the way two
+  ends of a real TCP connection are.** Closing one side there makes
+  deadline and I/O calls on the *other* side start failing too — a
+  behavior real sockets don't have. A test that closes its fake peer's
+  end immediately after writing a response can race the code under test,
+  which may still be finishing up (clearing its own deadline, in this
+  case) on the other end; the fix is for the test to simply not close
+  early, not to add synchronization the production code doesn't need.
+- **Verified against a live swarm, not just synthetic peers.** Dialing
+  every address a real tracker returned for a real torrent completed
+  handshakes with a mix of real BitTorrent clients (qBittorrent,
+  Transmission, Deluge, libtorrent) at roughly the success rate the
+  design expects, with every failure falling cleanly into one of the
+  categories above rather than an unexplained one.

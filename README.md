@@ -5,10 +5,12 @@ A BitTorrent v1 client, implemented from the protocol specification in Go, with 
 [![CI](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml/badge.svg)](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml)
 
 **Status:** actively in development. The bencode codec, `.torrent` metainfo
-parsing, and the tracker client are all done. A `.torrent` file parses into
-a validated, typed struct with a cross-checked info hash; the tracker
-client turns that into a live list of peer addresses, verified end-to-end
-against a real public tracker. Still to come: the peer wire protocol.
+parsing, the tracker client, and the peer handshake are all done. A
+`.torrent` file parses into a validated, typed struct with a cross-checked
+info hash; the tracker client turns that into a live list of peer
+addresses; and this client can now open a TCP connection to a real peer
+and complete the protocol handshake that identifies both sides. Still to
+come: the rest of the wire protocol (piece requests and transfer).
 
 ## Demo
 
@@ -103,6 +105,23 @@ Full rationale: `docs/architecture.md`.
   by inspecting the actual type of the `peers` value rather than assuming
   the tracker honored `compact=1`. Real trackers don't always agree with
   the spec, and the parser has to survive that rather than crash on it.
+- **Handshake serialization and parsing are pure functions**, with no
+  socket involved at all. The wire format can be verified against known
+  byte fixtures in a plain unit test; the network layer that exchanges
+  those bytes is a thin, separate piece built on top, and its own tests
+  swap in an in-memory connection instead of a real one.
+- **A peer connection carries one deadline for the whole handshake, and
+  the deadline is explicitly cleared once it succeeds.** Forgetting the
+  second half is the classic version of this bug: a stale deadline set
+  during connection setup fires hours later, in the middle of unrelated
+  work, and looks like a completely different failure.
+- **A peer that fails to connect or complete the handshake is an expected
+  outcome, not a bug to chase.** Most of the addresses a tracker returns
+  belong to peers that are offline, behind NAT, or gone — in practice,
+  over half of them. The client treats connection-refused, handshake
+  timeout, protocol mismatch, and info-hash mismatch as distinct,
+  logged outcomes rather than one opaque failure, so a low success rate
+  is legible instead of alarming.
 
 ## Performance
 
@@ -142,6 +161,18 @@ body, a non-200 status, a slow response that must trigger the timeout, and
 a body larger than the size cap. It's also been verified against a real
 public tracker (Debian's), which returned a live list of peers for a real
 torrent — the actual proof this layer works outside of tests.
+
+The peer handshake has byte-fixture tests for serialization (known input,
+exact expected 68 bytes) and parsing (round-trip, truncated input, wrong
+protocol string, empty input). The connection layer is tested with
+`net.Pipe`, standing in a fake peer that can misbehave in ways a real
+network never reproduces on demand — sending a mismatched info hash,
+a wrong protocol string, half a handshake before disconnecting, or
+nothing at all. It's also been run against real peers from a live
+BitTorrent swarm: over a third completed a full handshake, returning
+real peer IDs identifying live qBittorrent, Transmission, Deluge, and
+libtorrent clients — the rest failed the way real peers normally do
+(refused, timed out, or reset), exactly the profile the design expects.
 
 ## What I'd do differently
 
