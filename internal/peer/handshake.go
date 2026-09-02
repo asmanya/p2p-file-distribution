@@ -36,10 +36,10 @@ func ParseHandshake(r io.Reader) (Handshake, error) {
 	}
 
 	if buf[0] != byte(len(protocolString)) {
-		return Handshake{}, fmt.Errorf("peer: invalid protocol string length %d", buf[0])
+		return Handshake{}, fmt.Errorf("peer: invalid protocol string length %d: %w", buf[0], ErrProtocolMismatch)
 	}
 	if string(buf[1:1+len(protocolString)]) != protocolString {
-		return Handshake{}, fmt.Errorf("peer: unexpected protocol string %q", buf[1:1+len(protocolString)])
+		return Handshake{}, fmt.Errorf("peer: unexpected protocol string %q: %w", buf[1:1+len(protocolString)], ErrProtocolMismatch)
 	}
 
 	var h Handshake
