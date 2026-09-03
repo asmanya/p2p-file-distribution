@@ -5,12 +5,14 @@ A BitTorrent v1 client, implemented from the protocol specification in Go, with 
 [![CI](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml/badge.svg)](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml)
 
 **Status:** actively in development. The bencode codec, `.torrent` metainfo
-parsing, the tracker client, and the peer handshake are all done. A
-`.torrent` file parses into a validated, typed struct with a cross-checked
-info hash; the tracker client turns that into a live list of peer
-addresses; and this client can now open a TCP connection to a real peer
-and complete the protocol handshake that identifies both sides. Still to
-come: the rest of the wire protocol (piece requests and transfer).
+parsing, the tracker client, and the full peer wire protocol up through
+the handshake and message exchange are all done. A `.torrent` file parses
+into a validated, typed struct with a cross-checked info hash; the tracker
+client turns that into a live list of peer addresses; and this client can
+now open a TCP connection to a real peer, complete the handshake, exchange
+bitfields, and hold a live choke/unchoke/interested conversation over a
+buffered connection. Still to come: requesting and assembling actual piece
+data.
 
 ## Demo
 
@@ -122,6 +124,36 @@ Full rationale: `docs/architecture.md`.
   timeout, protocol mismatch, and info-hash mismatch as distinct,
   logged outcomes rather than one opaque failure, so a low success rate
   is legible instead of alarming.
+- **A keep-alive gets its own sentinel message ID instead of being
+  represented as `nil`.** Returning `nil, nil` from a read function is a
+  well-known Go footgun — every caller has to remember to check for it,
+  and the one place that forgets is a nil-pointer panic waiting to
+  happen, especially once many connections are running concurrently. A
+  sentinel keeps keep-alive as just another case in an exhaustive switch.
+- **A piece bitfield's bit order is pinned down with an exhaustive test**,
+  not spot-checked. Getting piece-0-is-the-MSB backwards produces no
+  obvious symptom — pieces just look randomly unavailable — so every bit
+  in a small bitfield is set and checked individually rather than trusting
+  a couple of hand-picked examples to catch a systematic ordering bug.
+- **Every payload parser validates a peer's numbers against this
+  torrent's actual geometry before trusting them** — piece index against
+  piece count, block offset and length against piece length. A peer's
+  message is input, not fact; skipping this is exactly how a single
+  malformed `request` turns into an out-of-bounds array access.
+- **The connection is wrapped in a buffered reader specifically so message
+  framing doesn't cost a syscall per read.** A message's 4-byte length and
+  its body would otherwise be two separate reads each; multiplied across
+  every message in a real download, that's a measurable amount of
+  avoidable kernel transitions for no benefit.
+- **Reading a message never assumes it lines up with one TCP read.** TCP
+  is a byte stream with no message boundaries of its own — two messages
+  can arrive in a single read, or one message can arrive split across
+  several. Both are tested directly, because on a real network this isn't
+  an edge case, it's what happens whenever a peer is even slightly slow.
+- **An unrecognized message ID is parsed and returned, not rejected.**
+  Framing only needs to know how long a message is, not what every ID
+  means — rejecting anything unfamiliar would drop the connection over
+  perfectly normal extension messages this client doesn't implement yet.
 
 ## Performance
 
@@ -173,6 +205,18 @@ BitTorrent swarm: over a third completed a full handshake, returning
 real peer IDs identifying live qBittorrent, Transmission, Deluge, and
 libtorrent clients — the rest failed the way real peers normally do
 (refused, timed out, or reset), exactly the profile the design expects.
+
+The message protocol is covered at two levels. Pure tests check every
+message type's exact byte encoding, a round-trip through serialize and
+parse, and an exhaustive bitfield bit-ordering check (every index set and
+checked individually, not sampled). Stream-level tests then exercise
+framing the way a real TCP connection actually behaves: keep-alives mixed
+into a real message sequence, a hostile length prefix rejected before
+allocation, a truncated payload, two messages arriving in a single read,
+and a single message arriving split across three separate writes. It's
+also been run against a real peer from a live swarm: handshake, a full
+bitfield (3020/3020 pieces), an `interested` sent, and an `unchoke` back —
+a complete, live conversation using every message type this phase adds.
 
 ## What I'd do differently
 

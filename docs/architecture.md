@@ -181,9 +181,10 @@ as hostile until proven otherwise, the same posture `bencode` and
 Implements the BitTorrent wire protocol: pure encoding and decoding of
 handshakes and messages, plus a thin connection layer to exchange them
 over TCP. It has no download policy — deciding which piece to request
-next belongs to the `download` package, not here. This phase covers only
-the handshake; requests, transfer, and choke/unchoke messages arrive in
-later phases on top of the same structure.
+next belongs to the `download` package, not here. Two phases built this
+package: the handshake first, then framing, typed payloads, bitfields,
+and the connection wrapper that actually holds a live protocol
+conversation. Requesting and transferring real piece data is next.
 
 - **Serialization and parsing are pure functions, kept completely
   separate from the network code that uses them.** `Handshake.Serialize`
@@ -235,3 +236,51 @@ later phases on top of the same structure.
   Transmission, Deluge, libtorrent) at roughly the success rate the
   design expects, with every failure falling cleanly into one of the
   categories above rather than an unexplained one.
+- **Keep-alive is a sentinel message ID, not a `nil` message.** The
+  alternative — a read function returning `nil, nil` — is a classic Go
+  footgun: every caller has to remember to check for it, and once
+  connections run concurrently in a later phase, the one caller that
+  forgets is a nil-pointer panic. A sentinel ID keeps keep-alive as just
+  another case in an exhaustive switch, which the type system can help
+  enforce and a missed check can't silently compile away.
+- **Message framing guards the length prefix before allocating the
+  buffer for it**, the same guard-before-allocate discipline `bencode`
+  established for string lengths and nesting depth. A 4-byte prefix
+  claiming gigabytes is rejected on the spot rather than turned into an
+  allocation first.
+- **Every typed payload parser (`have`, `request`, `piece`) validates a
+  peer's numbers against this torrent's actual piece count and piece
+  length before trusting them.** A peer's request is input, not fact — an
+  out-of-range piece index or a block that overruns its piece boundary is
+  exactly the kind of malformed message that turns into an out-of-bounds
+  panic if it reaches an array unchecked.
+- **A piece bitfield's bit order (piece 0 = the first byte's MSB) is
+  pinned by an exhaustive test**, not a couple of spot checks. Getting
+  this backwards produces no clear symptom — pieces just look
+  unavailable at seemingly random indices — so the test sets every bit
+  in a small bitfield individually and confirms only that exact index
+  reads back true.
+- **The connection is wrapped in a buffered reader specifically to avoid
+  a syscall per message.** Without it, a message's 4-byte length prefix
+  and its body are two separate reads, each a user-space/kernel-space
+  transition; across every message in a real download that adds up to a
+  measurable, avoidable cost for no benefit. The buffered reader is
+  explicitly single-goroutine-owned — it isn't safe to share, which lines
+  up with each connection eventually belonging to exactly one goroutine.
+- **Message reads are tested against both ways TCP actually behaves, not
+  just the happy path of one message per read.** Two whole messages
+  arriving in a single underlying read, and a single message arriving
+  split across three separate writes, are both explicitly covered — this
+  is the exact class of bug that never reproduces on a fast local network
+  and shows up constantly against a real, slightly slow peer.
+- **An unrecognized message ID parses successfully instead of erroring.**
+  `ReadMessage`'s job is framing — knowing where a message ends — not
+  understanding every ID that could ever appear on the wire. Rejecting
+  unfamiliar IDs would drop the connection on any peer using an extension
+  message this client doesn't implement yet, which is the wrong trade for
+  a protocol designed to be extended.
+- **Manually verified against a real peer from a live swarm**: handshake,
+  a full bitfield (3020/3020 pieces for the Debian torrent), a sent
+  `interested`, and a received `unchoke` — a complete conversation
+  exercising every message type this phase introduces, not just the
+  individual pieces in isolation.
