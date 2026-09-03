@@ -2,7 +2,9 @@ package peer
 
 import (
 	"bufio"
+	"fmt"
 	"net"
+	"time"
 )
 
 // Conn wraps a handshaken peer connection: buffered I/O, identity, and per-connection protocol state. Owned by exactly
@@ -32,4 +34,32 @@ func newConn(conn net.Conn, peerID [20]byte, reserved [8]byte) *Conn {
 		AmChoking:   true, // both sides start choked/not-interested per spec
 		PeerChoking: true,
 	}
+}
+
+// SetIODeadline sets a deadline on the underlying connection for the next
+// read or write. Every network operation on a Conn must go through this -
+// there are no deadline-free reads or writes.
+func (c *Conn) SetIODeadline(d time.Duration) error {
+	if err := c.conn.SetDeadline(time.Now().Add(d)); err != nil {
+		return fmt.Errorf("peer: set deadline: %w", err)
+	}
+	return nil
+}
+
+// ReadMessage reads the next message from the connection's buffered reader.
+func (c *Conn) ReadMessage() (Message, error) {
+	return ReadMessage(c.reader)
+}
+
+// SendMessage serializes and writes m to the connection.
+func (c *Conn) SendMessage(m Message) error {
+	if _, err := c.conn.Write(m.Serialize()); err != nil {
+		return fmt.Errorf("peer: write message: %w", err)
+	}
+	return nil
+}
+
+// Close closes the underlying connection.
+func (c *Conn) Close() error {
+	return c.conn.Close()
 }
