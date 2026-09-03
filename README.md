@@ -3,6 +3,9 @@
 A BitTorrent v1 client, implemented from the protocol specification in Go, with zero third-party runtime dependencies.
 
 [![CI](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml/badge.svg)](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/asmanya/p2p-file-distribution)](https://goreportcard.com/report/github.com/asmanya/p2p-file-distribution)
+[![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](go.mod)
+[![License: MIT](https://img.shields.io/github/license/asmanya/p2p-file-distribution)](LICENSE)
 
 **Status:** actively in development. The bencode codec, `.torrent` metainfo
 parsing, the tracker client, and the full peer wire protocol up through
