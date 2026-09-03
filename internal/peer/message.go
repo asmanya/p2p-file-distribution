@@ -60,10 +60,6 @@ type Message struct {
 	Payload []byte
 }
 
-// maxMessageLength caps a message's declared length before any allocation. The real cap with reasoning lands in
-// limits.go, this is a temporary placeholder so ReadMessage can guard now instead of later
-const maxMessageLength = 128 * 1024
-
 // ReadMessage reads and returns the next message from r.
 //
 // Wire layout: [4 bytes length][1 byte ID][payload...]. length counts the
@@ -93,8 +89,8 @@ func ReadMessage(r io.Reader) (Message, error) {
 
 	// Guard before allocating - a malicious/buggy peer could otherwise
 	// claim a multi-gigabyte length and exhaust memory with one message.
-	if length > maxMessageLength {
-		return Message{}, fmt.Errorf("peer: message length %d exceeds cap %d", length, maxMessageLength)
+	if length > MaxMessageLength {
+		return Message{}, fmt.Errorf("peer: message length %d exceeds cap %d", length, MaxMessageLength)
 	}
 
 	// buf holds ID + payload together: buf[0] is the ID, buf[1:] is
