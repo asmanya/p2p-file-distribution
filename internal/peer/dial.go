@@ -19,13 +19,6 @@ var (
 	ErrInfoHashMismatch = errors.New("peer: info hash mismatch")
 )
 
-// Conn wraps an established, handshaken connection to a peer.
-type Conn struct {
-	conn     net.Conn
-	PeerID   [20]byte
-	Reserved [8]byte
-}
-
 // Dial connects to addr, exchanges handshakes, and verifies infoHash matches.
 func Dial(addr string, infoHash, peerID [20]byte) (*Conn, error) {
 	// Bound how long establishing the TCP connection itself can take.
@@ -83,5 +76,5 @@ func handshakeOver(conn net.Conn, addr string, infoHash, peerID [20]byte) (*Conn
 		return nil, fmt.Errorf("peer: clear deadline: %w", err)
 	}
 
-	return &Conn{conn: conn, PeerID: theirs.PeerID, Reserved: theirs.Reserved}, nil
+	return newConn(conn, theirs.PeerID, theirs.Reserved), nil
 }
