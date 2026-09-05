@@ -3,19 +3,17 @@
 A BitTorrent v1 client, implemented from the protocol specification in Go, with zero third-party runtime dependencies.
 
 [![CI](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml/badge.svg)](https://github.com/asmanya/p2p-file-distribution/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/asmanya/p2p-file-distribution)](https://goreportcard.com/report/github.com/asmanya/p2p-file-distribution)
 [![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](go.mod)
 [![License: MIT](https://img.shields.io/github/license/asmanya/p2p-file-distribution)](LICENSE)
 
 **Status:** actively in development. The bencode codec, `.torrent` metainfo
-parsing, the tracker client, and the full peer wire protocol up through
-the handshake and message exchange are all done. A `.torrent` file parses
-into a validated, typed struct with a cross-checked info hash; the tracker
-client turns that into a live list of peer addresses; and this client can
-now open a TCP connection to a real peer, complete the handshake, exchange
-bitfields, and hold a live choke/unchoke/interested conversation over a
-buffered connection. Still to come: requesting and assembling actual piece
-data.
+parsing, the tracker client, and the full peer wire protocol are all done,
+and the client can now download and verify a single piece end to end: parse
+a `.torrent` file, announce to its tracker, connect and handshake with a
+real peer, exchange interest and unchoke, request and assemble a piece's
+blocks with pipelined requests, and confirm the result against its SHA-1
+hash. Still to come: downloading a whole torrent (multiple pieces,
+concurrently, across multiple peers) and writing the result to disk.
 
 ## Demo
 
@@ -157,6 +155,45 @@ Full rationale: `docs/architecture.md`.
   Framing only needs to know how long a message is, not what every ID
   means — rejecting anything unfamiliar would drop the connection over
   perfectly normal extension messages this client doesn't implement yet.
+- **SHA-1 is used for piece verification because the BitTorrent v1 spec
+  requires it, not because it's considered secure.** SHA-1 is
+  cryptographically broken — practical collisions exist. This is an
+  interoperability constraint, not a security choice.
+- **Piece and block boundary math lives in four small, pure functions**,
+  not inlined at each call site. That math is needed in at least four
+  places — building requests, validating incoming blocks, allocating
+  buffers, and eventually writing to disk — and an off-by-one fixed in one
+  inlined copy but missed in another is exactly the kind of bug that only
+  shows up on the last, short piece of a real torrent.
+- **A piece's immutable description and its in-progress download state are
+  two separate types, not one struct.** The description (index, expected
+  hash, length) is safe to pass around freely; the mutable state (buffer,
+  bytes downloaded, requests in flight) belongs to exactly one download
+  attempt. Collapsing them into one type would make it impossible to tell,
+  once concurrent downloads exist, which fields are safe to share and which
+  aren't.
+- **Every outgoing protocol message goes through one small set of sender
+  methods**, each carrying its own write deadline, rather than each call
+  site building a `Message` by hand. A peer with a full receive buffer can
+  block a write indefinitely; centralizing the deadline here means that
+  can't be forgotten at just one call site among many.
+- **Up to five block requests are kept in flight at once instead of one at
+  a time.** Waiting for each block's round trip before sending the next
+  turns network latency directly into download time; overlapping requests
+  hides that latency behind bandwidth instead. The exact number is a fixed
+  starting point, flagged for later tuning once there's a real throughput
+  measurement to tune against.
+- **A choking peer resets in-flight request bookkeeping immediately,
+  instead of waiting for those requests to time out.** A peer that chokes
+  mid-download silently drops every request already sent — it will never
+  answer them — so anything still counted as "in flight" at that moment has
+  to be treated as lost immediately, or the download stalls until an
+  unrelated timeout eventually notices.
+- **A piece download has three different timeouts, not one.** A fixed
+  overall cap bounds the whole attempt no matter what; a separate, shorter
+  idle-read deadline resets after every block that actually arrives. A
+  single fixed deadline would drop a peer that's slow but still making
+  progress — the idle deadline only fires once progress genuinely stops.
 
 ## Performance
 
@@ -221,6 +258,32 @@ also been run against a real peer from a live swarm: handshake, a full
 bitfield (3020/3020 pieces), an `interested` sent, and an `unchoke` back —
 a complete, live conversation using every message type this phase adds.
 
+Piece geometry has exhaustive table-driven tests, including both edge cases
+of a torrent's last piece — a full-length last piece when the total size is
+an exact multiple of the piece length, and a short one when it isn't —
+checked against ground-truth values recorded independently, not just
+against the program's own other output. Piece verification is tested
+against a known-good hash, a single corrupted byte, and an empty buffer.
+
+The single-piece download state machine is tested with a fake seeder over
+`net.Pipe` covering eight scenarios: a normal download, a corrupted block
+that must fail hash verification, blocks answered out of order that still
+assemble correctly, a mid-download choke and resume, a peer that goes
+silent and must trip a clean timeout, a peer that never unchokes, a
+malformed piece message with an out-of-range index that must be rejected
+without crashing, and the torrent's final short piece. It's also been
+verified against a real peer in a live swarm: a full piece downloaded from
+a real Debian mirror peer and confirmed byte-for-byte correct by its SHA-1
+hash — the first time this client has produced verified, trustworthy piece
+data from the open internet rather than a fixture.
+
 ## What I'd do differently
 
 *(placeholder — filled in at the end, as a retrospective)*
+
+- Support BitTorrent v2, which replaces SHA-1 piece hashes with SHA-256 — a
+  meaningful integrity improvement this v1-only client doesn't get.
+- Extend the metainfo model to actually support multi-file torrents in the
+  downloader — the struct was designed for it from the start, but
+  implementing it (real torrents are mostly multi-file) was kept out of
+  scope here.
