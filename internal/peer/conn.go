@@ -36,6 +36,14 @@ func newConn(conn net.Conn, peerID [20]byte, reserved [8]byte) *Conn {
 	}
 }
 
+// NewConn wraps an already-handshaken net.Conn. Exported for tests (in this
+// and other packages) that simulate a peer connection - e.g. over
+// net.Pipe() - without going through a real Dial/handshake. Production code
+// should always obtain a *Conn via Dial instead.
+func NewConn(conn net.Conn, peerID [20]byte, reserved [8]byte) *Conn {
+	return newConn(conn, peerID, reserved)
+}
+
 // SetIODeadline sets a deadline on the underlying connection for the next
 // read or write. Every network operation on a Conn must go through this -
 // there are no deadline-free reads or writes.
