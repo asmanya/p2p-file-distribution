@@ -9,12 +9,15 @@ import (
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
 )
 
-const (
+// unchokeTimeout, pieceTimeout, and readTimeout are vars, not consts, so
+// tests can shrink them temporarily instead of waiting out real timeouts.
+var (
 	unchokeTimeout = 15 * time.Second
 	pieceTimeout   = 30 * time.Second
 	readTimeout    = 15 * time.Second
-	backlogLimit   = 5 // TODO: adaptive backlog based on peer speed
 )
+
+const backlogLimit = 5 // TODO: adaptive backlog based on peer speed
 
 var ErrUnchokeTimeout = errors.New("download: peer did not unchoke in time")
 
