@@ -50,3 +50,10 @@ func (c *Client) Announce(announceURL string) (*AnnounceResponse, error) {
 
 	return ParseAnnounceResponse(body)
 }
+
+// Close releases any idle keep-alive connections this client is holding open. Call it once a Client is done
+// being used - without it, idle HTTP connections (and the goroutines backing them) linger until Go's default
+// idle-connection timeout, not immediately.
+func (c *Client) Close() {
+	c.httpClient.CloseIdleConnections()
+}
