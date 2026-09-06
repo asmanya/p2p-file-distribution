@@ -26,12 +26,13 @@ ones listed below it, and never on the ones above it.
 
 ## State ownership
 
-*(populated once shared mutable state is introduced, documenting who owns
-it — a goroutine or a mutex, never ambiguous)*
-
 | State | Owner | Notes |
 |-------|-------|-------|
-| — | — | — |
+| `workCh` (piece work items) | No owner — the channel itself is the synchronization | Buffered to exactly the piece count; a push can never block, by construction |
+| `resultCh` (verified results) | No owner — but every send races `ctx.Done()` in a `select` | Buffer is small and fixed, not sized to piece count, so an unconditional send could hang forever with no reader during shutdown |
+| `Progress.bytesDownloaded`, `.activePeers`, `.peakPeers`, `.connectAttempts/Successes`, `.hashFailures`, `.panics` | Written from any worker goroutine | `sync/atomic` counters — no mutex, each is a simple add/load |
+| `Progress.piecesDone`, `.samples` (rate window) | `Download`'s main goroutine only | Never touched by a worker; safe without synchronization because nothing else ever reaches it |
+| `connected` (dialed peer addresses, in `Download`) | `Download`'s main goroutine, via the `announce` closure | The mutex around it is defensive, not load-bearing — `announce` is only ever invoked from the main goroutine, never from a worker |
 
 ## Design notes
 
@@ -284,3 +285,74 @@ conversation. Requesting and transferring real piece data is next.
   `interested`, and a received `unchoke` — a complete conversation
   exercising every message type this phase introduces, not just the
   individual pieces in isolation.
+
+### internal/piece
+
+Piece and block boundary math, plus SHA-1 verification. Every function is
+pure — bytes and integers in, a value out, no I/O — so the geometry that
+every other layer depends on can be tested exhaustively in isolation.
+
+- **One set of geometry functions, used everywhere a piece or block
+  boundary is needed** — requesting, validating an incoming block,
+  sizing a buffer. Duplicating this math at each call site would let an
+  off-by-one fix land in one place and silently miss the others.
+- **The last piece's length is a first-class test case, not an
+  afterthought.** It's shorter than every other piece unless the total
+  length happens to divide evenly — the exact-multiple case is the trap,
+  since a naive remainder calculation returns 0 for it instead of a full
+  piece.
+- **`Work` (immutable) and `Progress` (mutable, single-goroutine) are
+  separate types**, not one struct. `Work` travels across the worker
+  channel in Phase 7 and must never be mutated by two goroutines at once;
+  keeping the in-flight buffer and byte counters out of it entirely
+  removes the possibility instead of relying on discipline.
+- **SHA-1 is used because the BitTorrent v1 spec requires it, not as a
+  security choice** — it's cryptographically broken, and the code and
+  README both say so explicitly, since it's the first thing a reviewer
+  will flag.
+
+### internal/download
+
+The only package with full system visibility: it owns the work queue,
+every peer worker goroutine, and assembly of verified pieces into the
+final file. Everything below it is mechanism; this is where policy lives.
+
+- **A single-piece download (interested → unchoke → pipelined block
+  requests → assemble → verify) is one function, reused unchanged by
+  every concurrent worker** — Phase 7 added concurrency around this
+  function, not inside it.
+- **Up to five block requests are pipelined per piece**, so round-trip
+  latency overlaps across blocks instead of serializing one request at a
+  time behind it — a fixed starting point, flagged for later tuning.
+- **A choking peer resets in-flight request bookkeeping immediately.** A
+  choke silently drops every request already sent; anything still
+  counted as in-flight has to be treated as lost right away, or the
+  download stalls waiting for answers that are never coming.
+- **A piece download has three timeouts, not one**: an overall cap, plus
+  a shorter idle-read deadline that resets on every block actually
+  received — so a slow-but-progressing peer survives, and only a
+  genuinely stalled one gets dropped.
+- **Concurrency is a plain work queue (Design A), not a coordinator.**
+  One channel, pre-filled with every piece, buffered to exactly the
+  piece count so a worst-case requeue storm can't deadlock. One goroutine
+  per peer; a failed or corrupt piece goes back on the queue for another
+  peer to try — recovery comes from the architecture, not explicit retry
+  logic.
+- **Every worker send that isn't provably safe races `ctx.Done()` in a
+  `select`.** `workCh`'s buffer is sized to make its sends safe by
+  construction; `resultCh`'s is not, so its send has to be cancellable or
+  a worker finishing at the wrong moment during shutdown can hang
+  `Download` forever.
+- **A worker's panic is recovered, loudly** — full stack trace at error
+  level plus a running count — so one bad peer can't take down every
+  other in-progress connection, and the failure still can't go unnoticed
+  during development.
+- **Progress counters are atomic where multiple workers touch them
+  (bytes, active/peak peers, connect stats, hash failures, panics), and
+  otherwise owned by `Download`'s main goroutine alone** (pieces done,
+  the rate window) — the same ownership-over-locking principle applied
+  throughout this codebase.
+- **Progress is printed from exactly one place**: a ticker in
+  `Download`'s own select loop. Workers never print directly — a hundred
+  goroutines writing to stdout independently would produce unreadable,
+  interleaved garbage.
