@@ -178,6 +178,9 @@ func TestPieceHappyPath(t *testing.T) {
 	conn, server := newTestConn(t)
 	go runFullSeeder(t, server, tor, work, expected, false)
 
+	if err := EnsureUnchoked(conn); err != nil {
+		t.Fatalf("EnsureUnchoked: %v", err)
+	}
 	got, err := Piece(conn, work, tor.PieceCount())
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
@@ -203,6 +206,9 @@ func TestPieceCorruptedBlockFailsHash(t *testing.T) {
 	conn, server := newTestConn(t)
 	go runFullSeeder(t, server, tor, work, expected, true)
 
+	if err := EnsureUnchoked(conn); err != nil {
+		t.Fatalf("EnsureUnchoked: %v", err)
+	}
 	if _, err := Piece(conn, work, tor.PieceCount()); err == nil {
 		t.Fatal("expected hash mismatch error, got nil")
 	}
@@ -257,6 +263,9 @@ func TestPieceOutOfOrderBlocksAssembleCorrectly(t *testing.T) {
 		}
 	}()
 
+	if err := EnsureUnchoked(conn); err != nil {
+		t.Fatalf("EnsureUnchoked: %v", err)
+	}
 	got, err := Piece(conn, work, tor.PieceCount())
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
@@ -329,6 +338,9 @@ func TestPieceChokeThenUnchokeResumes(t *testing.T) {
 		send(t, server, peer.Message{ID: peer.MsgPiece, Payload: buildPiecePayload(work.Index, req2.Begin, block2)})
 	}()
 
+	if err := EnsureUnchoked(conn); err != nil {
+		t.Fatalf("EnsureUnchoked: %v", err)
+	}
 	got, err := Piece(conn, work, tor.PieceCount())
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
@@ -390,6 +402,9 @@ func TestPieceGoesSilentTriggersReadTimeout(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}()
 
+	if err := EnsureUnchoked(conn); err != nil {
+		t.Fatalf("EnsureUnchoked: %v", err)
+	}
 	if _, err := Piece(conn, work, tor.PieceCount()); err == nil {
 		t.Fatal("expected a read-timeout error, got nil")
 	}
@@ -398,16 +413,14 @@ func TestPieceGoesSilentTriggersReadTimeout(t *testing.T) {
 // --- Case 6: peer never unchokes -------------------------------------------
 //
 // unchokeTimeout is shrunk the same way as readTimeout above. The seeder
-// reads "interested" and then does nothing at all - Piece() must give up
+// reads "interested" and then does nothing at all - EnsureUnchoked (the
+// one-time setup step that owns this wait, not Piece() itself) must give up
 // with a clean timeout error rather than wait forever for a peer that never
 // intends to serve us.
 func TestPieceNeverUnchokesTimesOut(t *testing.T) {
 	oldUnchoke := unchokeTimeout
 	unchokeTimeout = 200 * time.Millisecond
 	defer func() { unchokeTimeout = oldUnchoke }()
-
-	tor, _ := loadFixture(t)
-	work := pieceWork(t, tor, 0)
 
 	conn, server := newTestConn(t)
 
@@ -417,7 +430,7 @@ func TestPieceNeverUnchokesTimesOut(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}()
 
-	if _, err := Piece(conn, work, tor.PieceCount()); err == nil {
+	if err := EnsureUnchoked(conn); err == nil {
 		t.Fatal("expected an unchoke-timeout error, got nil")
 	}
 }
@@ -458,6 +471,9 @@ func TestPieceOutOfRangeIndexRejected(t *testing.T) {
 		send(t, server, peer.Message{ID: peer.MsgPiece, Payload: badPayload})
 	}()
 
+	if err := EnsureUnchoked(conn); err != nil {
+		t.Fatalf("EnsureUnchoked: %v", err)
+	}
 	if _, err := Piece(conn, work, tor.PieceCount()); err == nil {
 		t.Fatal("expected error for out-of-range piece index, got nil")
 	}
@@ -480,6 +496,9 @@ func TestPieceLastShortPiece(t *testing.T) {
 	conn, server := newTestConn(t)
 	go runFullSeeder(t, server, tor, work, expected, false)
 
+	if err := EnsureUnchoked(conn); err != nil {
+		t.Fatalf("EnsureUnchoked: %v", err)
+	}
 	got, err := Piece(conn, work, tor.PieceCount())
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
@@ -489,5 +508,89 @@ func TestPieceLastShortPiece(t *testing.T) {
 	}
 	if !bytes.Equal(got, expected) {
 		t.Error("downloaded bytes don't match expected piece content")
+	}
+}
+
+// --- Case 9: one connection, two pieces, one unchoke -------------------------
+//
+// EnsureUnchoked and Piece are deliberately separate calls so a connection
+// can be reused across many pieces without repeating the interested/unchoke
+// handshake for each one. This test is the direct proof of that: it calls
+// EnsureUnchoked exactly once, then Piece twice for two different pieces on
+// the same connection. Before that split existed, Piece did its own
+// interested-send-and-wait-for-unchoke on every call - which would have
+// hung here, since a peer that already unchoked us has no reason to send a
+// second, redundant unchoke message just because we asked for another piece.
+func TestPieceMultipleDownloadsOnSameConnection(t *testing.T) {
+	tor, data := loadFixture(t)
+	work0 := pieceWork(t, tor, 0)
+	work1 := pieceWork(t, tor, 1)
+	expected0 := pieceData(t, tor, data, 0)
+	expected1 := pieceData(t, tor, data, 1)
+	byIndex := map[int][]byte{0: expected0, 1: expected1}
+
+	conn, server := newTestConn(t)
+
+	// Same reader/writer split as runFullSeeder, for the same reason: two
+	// pieces means up to four pipelined block requests can arrive before
+	// this seeder's first response is read, so reading and writing must
+	// not block each other.
+	go func() {
+		outbox := make(chan peer.Message, 8)
+		writerDone := make(chan struct{})
+		go func() {
+			defer close(writerDone)
+			for msg := range outbox {
+				send(t, server, msg)
+			}
+		}()
+		defer func() {
+			close(outbox)
+			<-writerDone
+			server.Close()
+		}()
+
+		for {
+			msg, err := peer.ReadMessage(server)
+			if err != nil {
+				return
+			}
+			switch msg.ID {
+			case peer.MsgInterested:
+				outbox <- peer.Message{ID: peer.MsgUnchoke}
+			case peer.MsgRequest:
+				req, err := peer.ParseRequestPayload(msg.Payload, tor.PieceCount(), int(tor.PieceLength))
+				if err != nil {
+					return
+				}
+				expected, ok := byIndex[req.Index]
+				if !ok {
+					return
+				}
+				block := expected[req.Begin : req.Begin+req.Length]
+				outbox <- peer.Message{ID: peer.MsgPiece, Payload: buildPiecePayload(req.Index, req.Begin, block)}
+			}
+		}
+	}()
+
+	if err := EnsureUnchoked(conn); err != nil {
+		t.Fatalf("EnsureUnchoked: %v", err)
+	}
+
+	got0, err := Piece(conn, work0, tor.PieceCount())
+	if err != nil {
+		t.Fatalf("Piece(0): %v", err)
+	}
+	if !bytes.Equal(got0, expected0) {
+		t.Error("piece 0: downloaded bytes don't match expected content")
+	}
+
+	// No second EnsureUnchoked call - the whole point of this test.
+	got1, err := Piece(conn, work1, tor.PieceCount())
+	if err != nil {
+		t.Fatalf("Piece(1): %v", err)
+	}
+	if !bytes.Equal(got1, expected1) {
+		t.Error("piece 1: downloaded bytes don't match expected content")
 	}
 }

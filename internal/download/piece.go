@@ -21,33 +21,48 @@ const backlogLimit = 5 // TODO: adaptive backlog based on peer speed
 
 var ErrUnchokeTimeout = errors.New("download: peer did not unchoke in time")
 
-// Piece downloads a single piece from conn, blocking until the piece is fully assembled and hash-verified,
-// or an error occurs. pieceCount is the torrent's total piece count, needed to validate incoming have/request/piece
-// messages against this torrent's geometry.
+// EnsureUnchoked sends "interested" (if we haven't already declared it) and
+// blocks until the peer unchokes us, or gives up on us.
+//
+// This is a one-time, per-connection handshake step, deliberately kept
+// separate from Piece(): a worker downloading many pieces from the same
+// peer only needs to do this once, right after connecting - calling it
+// again before every piece would resend "interested" needlessly and, worse,
+// block waiting for a fresh "unchoke" message a peer that already unchoked
+// us has no reason to send twice.
+func EnsureUnchoked(conn *peer.Conn) error {
+	if !conn.AmInterested {
+		if err := conn.SendInterested(); err != nil {
+			return fmt.Errorf("download: send interested: %w", err)
+		}
+		conn.AmInterested = true
+	}
+
+	if !conn.PeerChoking {
+		return nil // already unchoked - e.g. a prior piece on this same conn
+	}
+
+	return waitForUnchoke(conn)
+}
+
+// Piece downloads a single piece over conn, blocking until the piece is
+// fully assembled and hash-verified, or an error occurs. It assumes the
+// connection is already interested and unchoked - call EnsureUnchoked once
+// per connection before the first call to Piece. pieceCount is the
+// torrent's total piece count, needed to validate incoming have/request/
+// piece messages against this torrent's geometry.
+//
+// A choke arriving mid-download is still handled here (see downloadBlocks) -
+// only the *initial* wait for the first unchoke lives in EnsureUnchoked.
 func Piece(conn *peer.Conn, work piece.Work, pieceCount int) ([]byte, error) {
-	// Step 1: tell the peer we want to download. Nothing else is allowed
-	// to happen on the wire until they respond with unchoke.
-	if err := conn.SendInterested(); err != nil {
-		return nil, fmt.Errorf("download: send interested: %w", err)
-	}
-	conn.AmInterested = true
-
-	// Step 2: block here until the peer unchokes us, or gives up on us.
-	if err := waitForUnchoke(conn); err != nil {
-		return nil, err
-	}
-
-	// Step 3: the actual pipelined request/receive loop - this is where
-	// most of the time and most of the bugs live.
 	buf, err := downloadBlocks(conn, work, pieceCount)
 	if err != nil {
 		return nil, err
 	}
 
-	// Step 4: trust nothing until the bytes match the hash from the
-	// .torrent file. A peer can lie, corrupt data in transit, or send
-	// blocks for the wrong piece entirely - this is the only check that
-	// catches all three.
+	// Trust nothing until the bytes match the hash from the .torrent file.
+	// A peer can lie, corrupt data in transit, or send blocks for the wrong
+	// piece entirely - this is the only check that catches all three.
 	ok, err := piece.Verify(buf, work.ExpectedHash)
 	if err != nil {
 		return nil, fmt.Errorf("download: piece %d: %w", work.Index, err)
