@@ -14,6 +14,11 @@ import (
 
 const bitfieldWaitTimeout = 10 * time.Second
 
+// requestBackoff is a small pause before a worker goes back to the queue after finding out the peer it's connected to
+// doesn't have the piece it just grabbed. Without it, a peer missing a piece the rest of the swarm also lacks turns
+// into a tight requeue/grab/requeue loop across every worker holding that connection - all CPU, no progress.
+const requeueBackoff = 50 * time.Millisecond
+
 // worker connects to one peer and downloads pieces from workCh until the queue is drained, the context is cancelled,
 // or the connection fails. Every piece it can't complete goes back onto workCh before it exits, so another
 // worker can pick it up from a healthier peer.
@@ -82,6 +87,7 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 		if conn.PeerBitfield != nil && !conn.PeerBitfield.HasPiece(work.Index) {
 			workCh <- work
 			current = nil
+			time.Sleep(requeueBackoff)
 			continue
 		}
 
