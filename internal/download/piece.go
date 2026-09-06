@@ -68,6 +68,7 @@ func Piece(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress)
 		return nil, fmt.Errorf("download: piece %d: %w", work.Index, err)
 	}
 	if !ok {
+		progress.HashFailed()
 		return nil, fmt.Errorf("download: piece %d: hash mismatch", work.Index)
 	}
 

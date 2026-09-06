@@ -30,6 +30,7 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 	var current *piece.Work
 	defer func() {
 		if r := recover(); r != nil {
+			progress.PanicRecovered()
 			slog.Error("worker: recovered from panic", "peer", addr, "panic", r, "stack", string(debug.Stack()))
 			if current != nil {
 				workCh <- *current
@@ -37,10 +38,12 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 		}
 	}()
 
+	progress.ConnectAttempted()
 	conn, err := peer.Dial(addr.String(), infoHash, peerID)
 	if err != nil {
 		return // dead-peer - expected, nothing to log loudly about here
 	}
+	progress.ConnectSucceeded()
 	defer conn.Close()
 	progress.PeerConnected()
 	defer progress.PeerDisconnected()
@@ -104,7 +107,16 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 		// invalidate the piece we already downloaded and verified
 		_ = conn.SendHave(work.Index)
 
-		resultCh <- Result{Index: work.Index, Data: data}
+		// A plain, unconditional send here would risk hanging forever: resultCh's buffer (queue.go) is a small fixed
+		// size, not one slot per piece like workCh's is, so it offers no such guarantee. If Download() has already
+		// taken its ctx.Done() shutdown path, nothing is left to drain this channel - without the ctx.Done() case
+		// below, a worker finishing at exactly the wrong moment would block here forever, and wg.Wait() in Download()
+		// would never return.
+		select {
+		case resultCh <- Result{Index: work.Index, Data: data}:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

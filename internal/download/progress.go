@@ -17,6 +17,13 @@ type Progress struct {
 
 	bytesDownloaded int64 // atomic
 	activePeers     int64 // atomic
+	peakPeers       int64 // atomic - highest activePeers has ever reached
+
+	connectAttempts  int64 // atomic
+	connectSuccesses int64 // atomic
+
+	hashFailures int64 // atomic - pieces that downloaded fully but failed SHA-1 verification
+	panics       int64 // atomic - worker goroutines that recovered from a panic
 
 	piecesDone int
 	samples    []rateSample
@@ -51,8 +58,18 @@ func (p *Progress) BytesDownloaded() int64 {
 // PeerConnected/PeerDisconnected track how many workers currently have a live connection. Called from worker
 // goroutine as they start and exit, hence atomic rather than a plain counter.
 func (p *Progress) PeerConnected() {
-	if p != nil {
-		atomic.AddInt64(&p.activePeers, 1)
+	if p == nil {
+		return
+	}
+	n := atomic.AddInt64(&p.activePeers, 1)
+	// Racing CompareAndSwap loop instead of a mutex: activePeers can dip and
+	// climb again as peers connect and disconnect, but peakPeers only ever
+	// needs to remember the highest value it has ever seen.
+	for {
+		peak := atomic.LoadInt64(&p.peakPeers)
+		if n <= peak || atomic.CompareAndSwapInt64(&p.peakPeers, peak, n) {
+			break
+		}
 	}
 }
 
@@ -67,6 +84,66 @@ func (p *Progress) ActivePeers() int64 {
 		return 0
 	}
 	return atomic.LoadInt64(&p.activePeers)
+}
+
+// PeakPeers returns the highest number of simultaneously connected peers this download has ever had.
+func (p *Progress) PeakPeers() int64 {
+	if p == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&p.peakPeers)
+}
+
+// ConnectAttempted/ConnectSucceeded track how many peer dial attempts were made and how many completed a handshake,
+// so the caller can report a connection success rate - tracker-returned peers are commonly 60-80% dead or unreachable,
+// and that's a normal, worth-recording fact about the swarm, not a bug.
+func (p *Progress) ConnectAttempted() {
+	if p != nil {
+		atomic.AddInt64(&p.connectAttempts, 1)
+	}
+}
+
+func (p *Progress) ConnectSucceeded() {
+	if p != nil {
+		atomic.AddInt64(&p.connectSuccesses, 1)
+	}
+}
+
+// ConnectStats returns the raw attempt/success counts behind the connection success rate.
+func (p *Progress) ConnectStats() (attempts, successes int64) {
+	if p == nil {
+		return 0, 0
+	}
+	return atomic.LoadInt64(&p.connectAttempts), atomic.LoadInt64(&p.connectSuccesses)
+}
+
+// HashFailed records a piece that downloaded completely but failed SHA-1 verification - a peer sent bad data.
+func (p *Progress) HashFailed() {
+	if p != nil {
+		atomic.AddInt64(&p.hashFailures, 1)
+	}
+}
+
+func (p *Progress) HashFailures() int64 {
+	if p == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&p.hashFailures)
+}
+
+// PanicRecovered records that a worker goroutine panicked and was recovered, so the panic isn't only visible as a
+// one-off log line during development - a nonzero count here after a long run is worth investigating.
+func (p *Progress) PanicRecovered() {
+	if p != nil {
+		atomic.AddInt64(&p.panics, 1)
+	}
+}
+
+func (p *Progress) Panics() int64 {
+	if p == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&p.panics)
 }
 
 // PieceCompleted records that one more piece finished and takes a rate sample. Must only be called from the

@@ -3,6 +3,7 @@ package download
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"sync"
 	"time"
@@ -11,6 +12,10 @@ import (
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
 	"github.com/asmanya/p2p-file-distribution/internal/tracker"
 )
+
+// progressLogInterval is how often Download logs a progress line while running. This is the only place progress is
+// printed - workers never print directly (see worker.go).
+const progressLogInterval = 1 * time.Second
 
 // listenPort is what we advertise to the tracker. This client doesn't actually accept incoming connections yet
 // (that's seeding) - the value only matters for filling in the announce URL.
@@ -28,6 +33,7 @@ const stallTimeout = 30 * time.Second
 // TODO: this holds the entire file in memory - fine for a torrent the size of a Linux ISO, but will exhaust memory
 // on anything much larger. Fixed by streaming verified pieces to disk instead, once storage exists.
 func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, peerID [20]byte) ([]byte, error) {
+	start := time.Now()
 	pieceCount := tor.PieceCount()
 	progress := NewProgress(pieceCount)
 
@@ -96,12 +102,24 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	lastProgress := time.Now()
 	lastAnnounce := time.Now()
 
+	progressTicker := time.NewTicker(progressLogInterval)
+	defer progressTicker.Stop()
+
 	for completed := 0; completed < pieceCount; {
 		select {
 		case <-ctx.Done():
 			cancel()
 			wg.Wait()
 			return nil, ctx.Err()
+
+		case <-progressTicker.C:
+			slog.Info("download progress",
+				"percent", fmt.Sprintf("%.1f%%", progress.Percent()),
+				"pieces", fmt.Sprintf("%d/%d", completed, pieceCount),
+				"rate_kib_s", fmt.Sprintf("%.1f", progress.Rate()/1024),
+				"peers", progress.ActivePeers(),
+				"eta", progress.ETA(tor.TotalLength).Round(time.Second),
+			)
 
 		case result := <-resultCh:
 			start, _, err := piece.Range(result.Index, pieceCount, tor.PieceLength, tor.TotalLength)
@@ -129,6 +147,21 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	close(workCh) // no more work - remaining idle workers see this and exit
 	cancel()      // belt-and-braces: unblocks anything still mid-operation
 	wg.Wait()     // don't return until worker has actually cleaned up
+
+	elapsed := time.Since(start)
+	attempts, successes := progress.ConnectStats()
+	var successRate float64
+	if attempts > 0 {
+		successRate = 100 * float64(successes) / float64(attempts)
+	}
+	slog.Info("download complete",
+		"elapsed", elapsed.Round(time.Second),
+		"avg_throughput_kib_s", fmt.Sprintf("%.1f", float64(tor.TotalLength)/elapsed.Seconds()/1024),
+		"peak_peers", progress.PeakPeers(),
+		"connect_success_rate", fmt.Sprintf("%.0f%% (%d/%d)", successRate, successes, attempts),
+		"hash_failures", progress.HashFailures(),
+		"panics_recovered", progress.Panics(),
+	)
 
 	return buf, nil
 }
