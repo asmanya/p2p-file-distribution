@@ -29,6 +29,7 @@ const stallTimeout = 30 * time.Second
 // on anything much larger. Fixed by streaming verified pieces to disk instead, once storage exists.
 func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, peerID [20]byte) ([]byte, error) {
 	pieceCount := tor.PieceCount()
+	progress := NewProgress(pieceCount)
 
 	// creating the queue
 	work := make([]piece.Work, pieceCount)
@@ -48,6 +49,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer tc.Close()
 
 	// calling workers
 	var wg sync.WaitGroup
@@ -79,7 +81,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			wg.Add(1)
 			go func(addr netip.AddrPort) {
 				defer wg.Done()
-				worker(ctx, addr, tor.InfoHash, peerID, pieceCount, workCh, resultCh)
+				worker(ctx, addr, tor.InfoHash, peerID, pieceCount, workCh, resultCh, progress)
 			}(addr)
 		}
 		return nil
@@ -96,6 +98,11 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 
 	for completed := 0; completed < pieceCount; {
 		select {
+		case <-ctx.Done():
+			cancel()
+			wg.Wait()
+			return nil, ctx.Err()
+
 		case result := <-resultCh:
 			start, _, err := piece.Range(result.Index, pieceCount, tor.PieceLength, tor.TotalLength)
 			if err != nil {
@@ -103,6 +110,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			}
 			copy(buf[start:], result.Data)
 			completed++
+			progress.PieceCompleted()
 			lastProgress = time.Now()
 
 		case <-time.After(stallTimeout):

@@ -54,8 +54,8 @@ func EnsureUnchoked(conn *peer.Conn) error {
 //
 // A choke arriving mid-download is still handled here (see downloadBlocks) -
 // only the *initial* wait for the first unchoke lives in EnsureUnchoked.
-func Piece(conn *peer.Conn, work piece.Work, pieceCount int) ([]byte, error) {
-	buf, err := downloadBlocks(conn, work, pieceCount)
+func Piece(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress) ([]byte, error) {
+	buf, err := downloadBlocks(conn, work, pieceCount, progress)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +108,7 @@ func waitForUnchoke(conn *peer.Conn) error {
 // reset every time SetIODeadline is called again below, so a peer that's
 // merely slow (but still making progress) survives, while one that's gone
 // silent gets dropped.
-func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int) ([]byte, error) {
+func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress) ([]byte, error) {
 	buf := make([]byte, work.Length)
 	var downloaded int64 // bytes actually copied into buf so far
 	backlog := 0         // requests currently in flight, unanswered
@@ -169,6 +169,7 @@ func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int) ([]byte, e
 			}
 			copy(buf[p.Begin:], p.Block)
 			downloaded += int64(len(p.Block))
+			progress.AddBytes(len(p.Block))
 			backlog--
 
 		case peer.MsgChoke:

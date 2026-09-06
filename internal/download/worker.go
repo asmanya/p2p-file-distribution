@@ -26,7 +26,7 @@ const requeueBackoff = 50 * time.Millisecond
 // A panic anywhere in this function is recovered, not left to crash the whole program - a single malicious or buggy
 // peer shouldn't be able to take down every other in-progress connection with it. The recovery is loud (full stack
 // trace at error level) precisely so it never quietly hides a real bug during development.
-func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte, pieceCount int, workCh chan piece.Work, resultCh chan Result) {
+func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte, pieceCount int, workCh chan piece.Work, resultCh chan Result, progress *Progress) {
 	var current *piece.Work
 	defer func() {
 		if r := recover(); r != nil {
@@ -42,6 +42,8 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 		return // dead-peer - expected, nothing to log loudly about here
 	}
 	defer conn.Close()
+	progress.PeerConnected()
+	defer progress.PeerDisconnected()
 
 	// Piece(), EnsureUnchoked(), and friends only know about read/write
 	// deadlines measured in seconds - they have no idea ctx exists. Rather
@@ -91,7 +93,7 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 			continue
 		}
 
-		data, err := Piece(conn, work, pieceCount)
+		data, err := Piece(conn, work, pieceCount, progress)
 		if err != nil {
 			workCh <- work
 			return // this connection is suspect - let another worker take over

@@ -181,7 +181,7 @@ func TestPieceHappyPath(t *testing.T) {
 	if err := EnsureUnchoked(conn); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	got, err := Piece(conn, work, tor.PieceCount())
+	got, err := Piece(conn, work, tor.PieceCount(), nil)
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestPieceCorruptedBlockFailsHash(t *testing.T) {
 	if err := EnsureUnchoked(conn); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	if _, err := Piece(conn, work, tor.PieceCount()); err == nil {
+	if _, err := Piece(conn, work, tor.PieceCount(), nil); err == nil {
 		t.Fatal("expected hash mismatch error, got nil")
 	}
 }
@@ -266,7 +266,7 @@ func TestPieceOutOfOrderBlocksAssembleCorrectly(t *testing.T) {
 	if err := EnsureUnchoked(conn); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	got, err := Piece(conn, work, tor.PieceCount())
+	got, err := Piece(conn, work, tor.PieceCount(), nil)
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestPieceChokeThenUnchokeResumes(t *testing.T) {
 	if err := EnsureUnchoked(conn); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	got, err := Piece(conn, work, tor.PieceCount())
+	got, err := Piece(conn, work, tor.PieceCount(), nil)
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
 	}
@@ -405,7 +405,7 @@ func TestPieceGoesSilentTriggersReadTimeout(t *testing.T) {
 	if err := EnsureUnchoked(conn); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	if _, err := Piece(conn, work, tor.PieceCount()); err == nil {
+	if _, err := Piece(conn, work, tor.PieceCount(), nil); err == nil {
 		t.Fatal("expected a read-timeout error, got nil")
 	}
 }
@@ -474,7 +474,7 @@ func TestPieceOutOfRangeIndexRejected(t *testing.T) {
 	if err := EnsureUnchoked(conn); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	if _, err := Piece(conn, work, tor.PieceCount()); err == nil {
+	if _, err := Piece(conn, work, tor.PieceCount(), nil); err == nil {
 		t.Fatal("expected error for out-of-range piece index, got nil")
 	}
 }
@@ -499,7 +499,7 @@ func TestPieceLastShortPiece(t *testing.T) {
 	if err := EnsureUnchoked(conn); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	got, err := Piece(conn, work, tor.PieceCount())
+	got, err := Piece(conn, work, tor.PieceCount(), nil)
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
 	}
@@ -577,7 +577,7 @@ func TestPieceMultipleDownloadsOnSameConnection(t *testing.T) {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
 
-	got0, err := Piece(conn, work0, tor.PieceCount())
+	got0, err := Piece(conn, work0, tor.PieceCount(), nil)
 	if err != nil {
 		t.Fatalf("Piece(0): %v", err)
 	}
@@ -586,7 +586,7 @@ func TestPieceMultipleDownloadsOnSameConnection(t *testing.T) {
 	}
 
 	// No second EnsureUnchoked call - the whole point of this test.
-	got1, err := Piece(conn, work1, tor.PieceCount())
+	got1, err := Piece(conn, work1, tor.PieceCount(), nil)
 	if err != nil {
 		t.Fatalf("Piece(1): %v", err)
 	}
