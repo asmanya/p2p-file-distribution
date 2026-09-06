@@ -38,6 +38,22 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 	}
 	defer conn.Close()
 
+	// Piece(), EnsureUnchoked(), and friends only know about read/write
+	// deadlines measured in seconds - they have no idea ctx exists. Rather
+	// than threading ctx through every one of them, this goroutine watches
+	// for cancellation and forces the connection closed the moment it
+	// happens, which makes any Read or Write currently blocked on it return
+	// immediately with an error instead of waiting out its own timeout.
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-watchDone:
+		}
+	}()
+
 	if err := receiveBitfield(conn, pieceCount); err != nil {
 		return
 	}
@@ -47,15 +63,19 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 	}
 
 	for {
+		// ctx.Done() sits in the same select as the channel read, not in a
+		// separate check beforehand - a lone "check, then maybe block on
+		// workCh" would miss a cancellation that arrives while this worker
+		// is sitting idle waiting for a piece that never comes.
+		var work piece.Work
+		var ok bool
 		select {
 		case <-ctx.Done():
 			return
-		default:
-		}
-
-		work, ok := <-workCh
-		if !ok {
-			return // queue closed - download is complete or shutting down
+		case work, ok = <-workCh:
+			if !ok {
+				return // queue closed - download is complete or shutting down
+			}
 		}
 		current = &work
 
