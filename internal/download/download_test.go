@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -62,6 +63,7 @@ func TestDownloadCleansUpOnCancel(t *testing.T) {
 	tor, _ := loadFixture(t)
 	tor.Announce = fakeTrackerServer(t, someUnreachableAddrs(5))
 	tc := tracker.NewClient()
+	outputPath := filepath.Join(t.TempDir(), tor.Name)
 
 	before := runtime.NumGoroutine()
 
@@ -70,7 +72,7 @@ func TestDownloadCleansUpOnCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		Download(ctx, tor, tc, [20]byte{})
+		Download(ctx, tor, tc, [20]byte{}, outputPath)
 	}()
 
 	time.Sleep(50 * time.Millisecond) // let Download start and dial attempts begin

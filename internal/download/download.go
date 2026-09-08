@@ -10,6 +10,7 @@ import (
 
 	"github.com/asmanya/p2p-file-distribution/internal/metainfo"
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
+	"github.com/asmanya/p2p-file-distribution/internal/storage"
 	"github.com/asmanya/p2p-file-distribution/internal/tracker"
 )
 
@@ -25,24 +26,27 @@ const listenPort = 6881
 // worth re-announcing to the tracker for a fresh peer list.
 const stallTimeout = 30 * time.Second
 
-// Download concurrently downloads every piece of tor, one worker goroutine per connected peer, and returns
-// the assembled, fully verified file contents. It announces to tc once up front, and again - no more often than the
+// Download concurrently downloads every piece of tor, one worker goroutine per connected peer, and writes each verified
+// piece straight to outputPath at its correct offset. It announces to tc once up front, and again - no more often than the
 // tracker's own minimum interval allows - whenever no piece has completed for stallTimeout, so a torrent doesn't get
 // stuck forever on whatever peers happened to be in the first response.
-//
-// TODO: this holds the entire file in memory - fine for a torrent the size of a Linux ISO, but will exhaust memory
-// on anything much larger. Fixed by streaming verified pieces to disk instead, once storage exists.
-func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, peerID [20]byte) ([]byte, error) {
+func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, peerID [20]byte, outputPath string) error {
 	start := time.Now()
 	pieceCount := tor.PieceCount()
 	progress := NewProgress(pieceCount)
+
+	sf, err := storage.Create(outputPath, tor.TotalLength)
+	if err != nil {
+		return fmt.Errorf("download: create output file: %w", err)
+	}
+	defer sf.Close()
 
 	// creating the queue
 	work := make([]piece.Work, pieceCount)
 	for i := 0; i < pieceCount; i++ {
 		length, err := piece.Length(i, pieceCount, tor.PieceLength, tor.TotalLength)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		work[i] = piece.Work{
 			Index:        i,
@@ -94,11 +98,9 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	}
 
 	if err := announce(); err != nil {
-		return nil, fmt.Errorf("download: initial announce: %w", err)
+		return fmt.Errorf("download: initial announce: %w", err)
 	}
 
-	// joining pieces together
-	buf := make([]byte, tor.TotalLength)
 	lastProgress := time.Now()
 	lastAnnounce := time.Now()
 
@@ -110,7 +112,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 		case <-ctx.Done():
 			cancel()
 			wg.Wait()
-			return nil, ctx.Err()
+			return ctx.Err()
 
 		case <-progressTicker.C:
 			slog.Info("download progress",
@@ -122,11 +124,9 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			)
 
 		case result := <-resultCh:
-			start, _, err := piece.Range(result.Index, pieceCount, tor.PieceLength, tor.TotalLength)
-			if err != nil {
-				return nil, err
+			if err := sf.WritePiece(result.Index, pieceCount, tor.PieceLength, tor.TotalLength, result.Data); err != nil {
+				return fmt.Errorf("download: write piece %d: %w", result.Index, err)
 			}
-			copy(buf[start:], result.Data)
 			completed++
 			progress.PieceCompleted()
 			lastProgress = time.Now()
@@ -148,6 +148,10 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	cancel()      // belt-and-braces: unblocks anything still mid-operation
 	wg.Wait()     // don't return until worker has actually cleaned up
 
+	if err := sf.Sync(); err != nil {
+		return fmt.Errorf("download: sync output file: %w", err)
+	}
+
 	elapsed := time.Since(start)
 	attempts, successes := progress.ConnectStats()
 	var successRate float64
@@ -163,5 +167,5 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 		"panics_recovered", progress.Panics(),
 	)
 
-	return buf, nil
+	return nil
 }

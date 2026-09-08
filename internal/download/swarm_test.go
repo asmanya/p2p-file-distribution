@@ -5,6 +5,8 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -161,13 +163,18 @@ func TestDownloadLocalSwarm(t *testing.T) {
 	}
 	tor.Announce = fakeTrackerServer(t, addrs)
 	tc := tracker.NewClient()
+	outputPath := filepath.Join(t.TempDir(), tor.Name)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	got, err := Download(ctx, tor, tc, [20]byte{})
-	if err != nil {
+	if err := Download(ctx, tor, tc, [20]byte{}, outputPath); err != nil {
 		t.Fatalf("Download: %v", err)
+	}
+
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read downloaded file: %v", err)
 	}
 	if !bytes.Equal(got, data) {
 		t.Error("downloaded bytes don't match the fixture file")
