@@ -2,8 +2,8 @@
 
 ## Layers
 
-Seven layers, dependencies point downward only — a package may depend on the
-ones listed below it, and never on the ones above it.
+Seven layers. A package can depend on anything listed below it, never on
+anything above.
 
 ```
 7 cmd/p2pget          CLI. Flags + wiring only. No logic.
@@ -16,343 +16,428 @@ ones listed below it, and never on the ones above it.
 1 internal/bencode    Serialization. Zero knowledge of torrents.
 ```
 
-- `bencode` never references torrents, pieces, or peers.
-- `metainfo` never opens a socket or writes to disk.
-- `peer` implements mechanism (sending/parsing messages), never policy (which
-  piece to request next) — policy belongs to `download`.
-- `piece` has no I/O at all — every function takes bytes in, returns a value.
-- `cmd` has no logic beyond flag parsing and a single call into
-  `internal/download`.
+`bencode` never references torrents, pieces, or peers. `metainfo` never
+opens a socket or writes to disk. `peer` implements mechanism — sending
+and parsing messages — never policy; deciding which piece to request
+next belongs to `download`. `piece` does no I/O at all: every function
+takes bytes and integers in, returns a value. `cmd` has no logic beyond
+flag parsing and a single call into `internal/download`.
 
 ## State ownership
 
 | State | Owner | Notes |
 |-------|-------|-------|
-| `workCh` (piece work items) | No owner — the channel itself is the synchronization | Buffered to exactly the piece count; a push can never block, by construction |
-| `resultCh` (verified results) | No owner — but every send races `ctx.Done()` in a `select` | Buffer is small and fixed, not sized to piece count, so an unconditional send could hang forever with no reader during shutdown |
-| `Progress.bytesDownloaded`, `.activePeers`, `.peakPeers`, `.connectAttempts/Successes`, `.hashFailures`, `.panics` | Written from any worker goroutine | `sync/atomic` counters — no mutex, each is a simple add/load |
-| `Progress.piecesDone`, `.samples` (rate window) | `Download`'s main goroutine only | Never touched by a worker; safe without synchronization because nothing else ever reaches it |
-| `connected` (dialed peer addresses, in `Download`) | `Download`'s main goroutine, via the `announce` closure | The mutex around it is defensive, not load-bearing — `announce` is only ever invoked from the main goroutine, never from a worker |
+| `workCh` (piece work items) | No owner — the channel is the synchronization | Buffered to exactly the piece count, so a push can never block |
+| `resultCh` (verified results) | No owner, but every send races `ctx.Done()` in a `select` | The buffer is small and fixed, not sized to piece count, so an unconditional send could hang forever with no reader during shutdown |
+| `Progress.bytesDownloaded`, `.activePeers`, `.peakPeers`, `.connectAttempts/Successes`, `.hashFailures`, `.panics` | Any worker goroutine | Plain `sync/atomic` counters, no mutex |
+| `Progress.piecesDone`, `.samples` (rate window) | `Download`'s main goroutine only | No worker ever touches these |
+| `connected` (dialed peer addresses, inside `Download`) | `Download`'s main goroutine, through the `announce` closure | The mutex is defensive rather than load-bearing — `announce` is only ever called from the main goroutine |
+| `HaveBitfield.bf` (pieces already verified or on disk) | Mutex-guarded | Only the main goroutine writes today, as pieces complete; seeding will add concurrent readers later, so the mutex is already in place |
+| `storage.File` writes (`WriteAt` per piece) | No owner needed | Each piece owns a disjoint byte range, and positional writes to non-overlapping ranges don't need a lock |
 
 ## Design notes
 
 ### internal/bencode
 
-The lowest layer: bencode serialization, with no awareness of torrents,
-pieces, or peers. Every other package's correctness eventually rests on
-this one being both exhaustively type-safe and hostile-input-safe, since
-`.torrent` files and tracker responses are the first untrusted data the
-client ever touches.
+The lowest layer. Bencode serialization with no idea torrents, pieces,
+or peers exist. Almost everything else in the client rests on this
+being both exhaustively type-safe and safe against hostile input, since
+`.torrent` files and tracker responses are the first untrusted data it
+touches.
 
-- **Sealed `Value` interface.** The four concrete types (`ByteString`,
-  `Integer`, `List`, `Dictionary`) satisfy `Value` through an unexported
-  marker method, so no other package can add a fifth. Every type switch on
-  `Value` elsewhere in the codebase can stay exhaustive without a `default`
-  case masking a missed type — chosen deliberately over a reflection-based
-  decoder, which would push that same class of mistake to runtime instead
-  of the compiler.
-- **Guards are checked before allocation, not after.** A string length or
-  nesting depth is validated against a fixed cap before any buffer is
-  created or any recursive call is made — an oversized length prefix or a
-  deeply nested input is rejected for free, with no memory or stack cost.
-- **Byte strings are opaque bytes, never text.** The decoder performs no
-  UTF-8 validation or normalization, since piece hashes are raw binary; any
-  implicit text handling would silently corrupt them.
-- **Dictionary keys are strictly ascending on decode, and byte-wise sorted
-  (never locale-aware) on encode.** Both sides of this are load-bearing:
-  encoding must produce a canonical byte sequence for the info-hash
-  computation to be reproducible, and decoding must reject anything that
-  doesn't already satisfy that canonical form, so a malformed input fails
-  where it occurs instead of as a mysterious hash mismatch elsewhere.
-- **Round-trip and fuzz tests are the actual proof, not the unit tests.**
-  Decoding and re-encoding both real `.torrent` fixtures byte-for-byte
-  demonstrates the encoder is canonical and the decoder lossless — which is
-  exactly what the info-hash computation depends on. A native Go fuzz
-  target, seeded from every known edge case, then checks the same
-  decode/encode pair holds under random and mutated input, and that
-  malformed input always fails as an error, never a panic.
+Four concrete types — `ByteString`, `Integer`, `List`, `Dictionary` —
+satisfy a sealed `Value` interface through an unexported marker method,
+so nothing outside the package can add a fifth. Every type switch on
+`Value` elsewhere in the codebase stays exhaustive without a `default`
+case quietly swallowing a missed type. That was a deliberate choice over
+a reflection-based decoder, which would push the same class of mistake
+to runtime instead of catching it at compile time.
+
+Size and depth guards run before allocation, not after — a string
+length or nesting depth gets checked against a fixed cap before any
+buffer exists or any recursive call happens, so an oversized length
+prefix or a deeply nested input costs nothing to reject. Byte strings
+stay opaque bytes rather than text; the decoder never validates or
+normalizes them as UTF-8, because piece hashes are raw binary and any
+implicit text handling would silently corrupt them.
+
+Dictionary keys are required to be strictly ascending on decode, and
+sorted byte-wise (never locale-aware) on encode. Both halves matter:
+encoding has to produce the same canonical byte sequence every time for
+the info-hash computation to be reproducible, and decoding has to reject
+anything that doesn't already satisfy that form, so a malformed file
+fails right where the problem is instead of surfacing later as a
+mysterious hash mismatch.
+
+The real proof of correctness isn't the unit tests, it's the round-trip
+and fuzz tests. Decoding and re-encoding both real `.torrent` fixtures
+byte-for-byte is what demonstrates the encoder is canonical and the
+decoder lossless — exactly what the info-hash computation depends on. A
+native Go fuzz target, seeded from every known edge case, checks that
+same decode/encode pair under random and mutated input, and confirms
+malformed input always comes back as an error, never a panic.
 
 ### internal/metainfo
 
-Converts a parsed bencode tree into the flat, typed `Torrent` struct the
-rest of the client actually works with, and computes the 20-byte info
-hash that identifies a torrent to trackers and peers. No network, no disk
+Turns a parsed bencode tree into the flat, typed `Torrent` struct the
+rest of the client works with, and computes the 20-byte info hash that
+identifies a torrent to trackers and peers. No network access, no disk
 writes beyond reading the `.torrent` file itself.
 
-- **Two representations, one explicit conversion.** The raw bencode tree
-  and the application-level `Torrent` struct are deliberately different
-  shapes — the tree is generic and nested, the struct is flat and specific
-  to what a torrent needs. `Parse` is the single, explicit boundary
-  between them, so the tree's general-purpose shape never leaks further
-  into the client.
-- **`InfoHash` is a fixed-size `[20]byte`, not a slice** — comparable with
-  `==`, usable as a map key, and its size is a compile-time guarantee.
-  Piece hashes (`[][20]byte`) follow the same reasoning: they get compared
-  against freshly-computed hashes constantly once downloading starts.
-- **Files are modeled as a list from day one**, even though only
-  single-file torrents parse today. A single-file torrent is just a
-  list of one `FileEntry` (`Path` = name, `Length` = total length).
-  Adding real multi-file support later means extending that list, not
-  reworking every piece of code — storage offsets included — that
-  assumed exactly one file.
-- **A torrent's `name` field is untrusted input and is validated before
-  anything else touches it.** It's rejected outright if it's empty,
-  contains a path separator, starts with a dot (catching `.` and `..`
-  components), or is an absolute path. This exists specifically because
-  the name will later be used to construct an output file path — without
-  the check, a crafted `.torrent` could write outside the intended
-  download directory via a name like `../../.ssh/authorized_keys`.
-- **Piece count is derived and cross-checked, never trusted as given.**
-  `ceil(TotalLength / PieceLength)` is compared against the actual number
-  of piece hashes present; a mismatch means the file is corrupt or
-  malicious and is rejected during parsing, not discovered mid-download.
-- **The info hash is computed two independent ways.** Method A re-encodes
-  the parsed `info` dictionary through the bencode encoder and hashes
-  that. Method B hashes the dictionary's original bytes directly, located
-  via byte offsets the decoder records while parsing (a narrow, justified
-  amendment to `bencode` — it reports offsets generically, with no
-  knowledge of what a caller does with them). `Parse` cross-checks that
-  both agree before returning successfully.
-  - Today, this cross-check can only ever pass: the decoder rejects
-    non-canonically-ordered dictionaries outright (see the `bencode`
-    section above), so Method A and Method B are structurally guaranteed
-    to agree. Its real value is future-facing — it's what would let
-    strict key-ordering be relaxed later (to accept real-world
-    `.torrent` files that don't quite follow spec) without ever risking
-    a silently wrong info hash.
-- **A golden test pins every parsed field against ground truth recorded
-  independently**, via `transmission-show` rather than this project's own
-  code, for both fixture torrents. This is the one test in the suite that
-  can catch a bug this project's own reasoning would reproduce and miss —
-  and it should never be deleted.
+The bencode tree and the `Torrent` struct are deliberately different
+shapes — one generic and nested, the other flat and specific to what a
+torrent actually needs — and `Parse` is the one explicit boundary
+between them, so the tree's general-purpose shape never leaks further
+into the client. `InfoHash` is a fixed-size `[20]byte` rather than a
+slice: comparable with `==`, usable as a map key, its size guaranteed at
+compile time. Piece hashes (`[][20]byte`) follow the same reasoning,
+since they get compared against freshly-computed hashes constantly once
+downloading starts.
+
+Files are already modeled as a list, even though only single-file
+torrents parse right now. A single-file torrent is just a list with one
+`FileEntry` (`Path` set to the name, `Length` to the total length), so
+adding real multi-file support later means extending that list rather
+than reworking everything — storage offsets included — that assumed
+exactly one file.
+
+A torrent's `name` field is untrusted input and gets validated before
+anything else touches it: rejected if it's empty, contains a path
+separator, starts with a dot (catching `.` and `..`), or is an absolute
+path. That check exists because the name eventually becomes an output
+file path, and without it a crafted `.torrent` could use a name like
+`../../.ssh/authorized_keys` to write outside the intended download
+directory.
+
+Piece count is derived and cross-checked rather than trusted as given —
+`ceil(TotalLength / PieceLength)` is compared against the actual number
+of piece hashes present, and a mismatch means the file is corrupt or
+malicious and gets rejected during parsing instead of discovered
+mid-download.
+
+The info hash is computed two independent ways. Method A re-encodes the
+parsed `info` dictionary through the bencode encoder and hashes that.
+Method B hashes the dictionary's original bytes directly, located
+through byte offsets the decoder records while parsing — a narrow,
+justified amendment to `bencode`, which just reports offsets generically
+and has no idea what a caller does with them. `Parse` checks that both
+agree before returning. Right now that check can only ever pass, since
+the decoder already rejects non-canonically-ordered dictionaries, so
+Method A and Method B are structurally guaranteed to match. Its value is
+future-facing: it's what would let strict key ordering be relaxed later,
+to accept real-world `.torrent` files that don't quite follow spec,
+without ever risking a silently wrong info hash.
+
+A golden test pins every parsed field against ground truth recorded
+independently, via `transmission-show` rather than this project's own
+code, for both fixture torrents. It's the one test in the suite that can
+catch a bug this project's own reasoning would reproduce and miss, and
+it should never be deleted.
 
 ### internal/tracker
 
-Turns a torrent's announce information into a live list of peer addresses.
-Its only responsibility is *who to talk to* — it never opens a connection
-to a peer itself, and everything network-facing here treats the response
-as hostile until proven otherwise, the same posture `bencode` and
-`metainfo` take toward their own untrusted input.
+Turns a torrent's announce information into a live list of peer
+addresses. Its only job is figuring out who to talk to — it never opens
+a connection to a peer itself — and it treats every response as hostile
+until proven otherwise, the same posture `bencode` and `metainfo` take
+toward their own input.
 
-- **Peer addresses are `net/netip.AddrPort`, not a custom struct.** It's
-  comparable and map-key-able at zero allocation cost, and it represents
-  IPv4 and IPv6 through the same type — both matter once duplicate peers
-  need deduplicating in a later phase.
-- **The peer ID is generated once per session with `crypto/rand`**, using
-  the Azureus-style convention (`-GO0001-` followed by 12 random bytes).
-  It's how a tracker tells this client's connections apart from every
-  other peer's in the swarm; predictability here buys nothing, so the
-  randomness is crypto-grade even though the value isn't a secret.
-- **The info hash and peer ID go into the announce URL as raw bytes,
-  percent-encoded — never as hex.** Go's `net/url` query encoding handles
-  arbitrary byte strings correctly on its own; hex is the common mistake
-  here; it produces a URL that looks plausible and fails against every
-  real tracker, since the tracker sees the wrong 20 bytes entirely.
-- **The tracker's HTTP client carries three guards that all come from the
-  same principle**: treat everything the network hands you as hostile
-  until it's proven otherwise. An explicit timeout (Go's default client
-  has none — a dead tracker hangs the program forever), a hard cap on how
-  much of the response body is read (an oversized or slow-drip body can't
-  exhaust memory), and a status-code check before the body is ever parsed
-  (a non-200 response is usually an HTML error page, not bencode).
-- **Both compact and legacy peer list formats are supported**, chosen by
-  inspecting the actual bencode type of the `peers` value rather than
-  trusting that a tracker honored `compact=1`. Real-world trackers
-  sometimes ignore the request; the parser has to survive that rather
-  than fail on a torrent that would otherwise work fine.
-- **A failed announce to one tracker doesn't fail the whole request.**
-  `announce-list` (BEP-12) is flattened into an ordered list of URLs and
-  tried in order; a URL with an unsupported scheme (UDP trackers are out
-  of scope for this client) or one that errors is skipped, not fatal.
-  This matters in practice — most real torrents list a UDP tracker first,
-  with an HTTP fallback further down the list, so skipping instead of
-  aborting is what makes real torrents work at all.
-- **Integration tests use a local `httptest` server, not a real tracker.**
-  Real trackers are flaky, rate-limit repeated hits, and return a
-  different peer list every time — none of which is reproducible in CI.
-  A local server can deterministically produce failure modes (garbage
-  body, non-200 status, a slow response, an oversized body) that would be
-  impractical to trigger against the real thing on demand. The client was
-  separately verified once against a real public tracker (Debian's),
-  which returned a genuine list of peers for a real torrent — that
-  one-time run is the actual proof this layer works outside of tests.
+Peer addresses are `net/netip.AddrPort` rather than a custom struct:
+comparable and usable as a map key at zero allocation cost, and it
+represents IPv4 and IPv6 through the same type, both of which matter
+once duplicate peers need deduplicating. The peer ID is generated once
+per session with `crypto/rand`, following the Azureus-style convention
+(`-GO0001-` followed by 12 random bytes) — it's how a tracker tells this
+client's connections apart from everyone else in the swarm, and while
+predictability here doesn't buy an attacker much, crypto-grade
+randomness costs nothing to use anyway.
+
+The info hash and peer ID go into the announce URL as raw bytes,
+percent-encoded, never as hex. Go's `net/url` query encoding handles
+arbitrary byte strings correctly on its own. Sending hex is the common
+mistake here — it produces a URL that looks plausible and fails against
+every real tracker, since the tracker ends up seeing the wrong 20 bytes
+entirely.
+
+The HTTP client carries three guards that all come from the same
+principle: treat anything the network hands you as hostile until it's
+proven otherwise. An explicit timeout, since Go's default client has
+none and a dead tracker would otherwise hang the program forever. A hard
+cap on how much of the response body gets read, so an oversized or
+slow-drip body can't exhaust memory. And a status-code check before the
+body is ever parsed, because a non-200 response is usually an HTML error
+page, not bencode.
+
+Both compact and legacy peer list formats are supported, chosen by
+inspecting the actual bencode type of the `peers` value rather than
+trusting that a tracker honored `compact=1`. Real-world trackers
+sometimes ignore that request, and the parser has to survive it rather
+than fail on a torrent that would otherwise work fine. Along the same
+lines, a failed announce to one tracker doesn't fail the whole request —
+`announce-list` (BEP-12) gets flattened into an ordered list of URLs and
+tried in order, and a URL with an unsupported scheme (UDP trackers are
+out of scope here) or one that errors is skipped rather than fatal. This
+matters in practice, since most real torrents list a UDP tracker first
+with an HTTP fallback further down; skipping instead of aborting is what
+makes real torrents work at all.
+
+Integration tests run against a local `httptest` server rather than a
+real tracker. Real trackers are flaky, rate-limit repeated hits, and
+return a different peer list every time, none of which is reproducible
+in CI. A local server can deterministically produce failure modes —
+garbage body, non-200 status, a slow response, an oversized body — that
+would be impractical to trigger against the real thing on demand. The
+client was separately verified once against a real public tracker
+(Debian's), which returned a genuine list of peers for a real torrent;
+that one-time run is the actual proof this layer works outside of
+tests.
 
 ### internal/peer
 
 Implements the BitTorrent wire protocol: pure encoding and decoding of
 handshakes and messages, plus a thin connection layer to exchange them
-over TCP. It has no download policy — deciding which piece to request
-next belongs to the `download` package, not here. Two phases built this
-package: the handshake first, then framing, typed payloads, bitfields,
-and the connection wrapper that actually holds a live protocol
-conversation. Requesting and transferring real piece data is next.
+over TCP. It carries no download policy — deciding which piece to
+request next belongs to `download`, not here.
 
-- **Serialization and parsing are pure functions, kept completely
-  separate from the network code that uses them.** `Handshake.Serialize`
-  and `ParseHandshake` take and return bytes; neither touches a socket.
-  A wire-format bug shows up as a plain byte-comparison test failure, not
-  as a flaky-looking network test — the same separation `bencode`'s
-  encoder/decoder and `metainfo`'s parser already rely on, applied here
-  for the first time to something a socket carries.
-- **The connection logic is split into a public `Dial` (owns the TCP
-  connection) and an internal `handshakeOver` (owns the handshake
-  exchange over any `net.Conn`).** Production code never sees the split;
-  it exists so tests can hand `handshakeOver` one end of an in-memory
-  `net.Pipe` instead of a real socket, and simulate failure modes — a
-  mismatched info hash, a wrong protocol string, a peer that disconnects
-  mid-handshake, one that never responds at all — that would be
-  impractical to trigger against a real connection on demand.
-- **One deadline covers dial, and a separate one covers the full
-  handshake exchange — write and read both.** A deadline set only before
-  the read would still let a peer that accepts a connection and never
-  reads hang the write, since a full send buffer blocks `Write` too.
-- **The handshake deadline is explicitly cleared the moment the exchange
-  succeeds.** Leaving it in place is the version of this bug that doesn't
-  show up until much later: the same deadline would eventually fire in
-  the middle of unrelated work in a future phase, and look like an
-  unrelated, intermittent failure rather than what it actually is.
-- **Connection-refused, handshake timeout, protocol mismatch, and
-  info-hash mismatch are distinguishable outcomes, not one generic
-  error.** Most addresses a tracker hands back belong to peers that are
-  offline, unreachable, or gone — that's normal, not a bug — and the
-  only way to tell "the swarm is mostly dead right now" from "my
-  handshake code is broken" is if the failure reasons are visible
-  instead of collapsed into one message.
-- **`handshakeTimeout` is a package variable, not a constant, purely so
-  tests can shrink it.** A test proving a slow/silent peer triggers a
-  timeout has to actually wait for the timeout to fire; letting the test
-  override the duration is the difference between that test taking
-  50 milliseconds and it taking 5 seconds for the exact same coverage.
-- **`net.Pipe`'s two ends are not independent of each other the way two
-  ends of a real TCP connection are.** Closing one side there makes
-  deadline and I/O calls on the *other* side start failing too — a
-  behavior real sockets don't have. A test that closes its fake peer's
-  end immediately after writing a response can race the code under test,
-  which may still be finishing up (clearing its own deadline, in this
-  case) on the other end; the fix is for the test to simply not close
-  early, not to add synchronization the production code doesn't need.
-- **Verified against a live swarm, not just synthetic peers.** Dialing
-  every address a real tracker returned for a real torrent completed
-  handshakes with a mix of real BitTorrent clients (qBittorrent,
-  Transmission, Deluge, libtorrent) at roughly the success rate the
-  design expects, with every failure falling cleanly into one of the
-  categories above rather than an unexplained one.
-- **Keep-alive is a sentinel message ID, not a `nil` message.** The
-  alternative — a read function returning `nil, nil` — is a classic Go
-  footgun: every caller has to remember to check for it, and once
-  connections run concurrently in a later phase, the one caller that
-  forgets is a nil-pointer panic. A sentinel ID keeps keep-alive as just
-  another case in an exhaustive switch, which the type system can help
-  enforce and a missed check can't silently compile away.
-- **Message framing guards the length prefix before allocating the
-  buffer for it**, the same guard-before-allocate discipline `bencode`
-  established for string lengths and nesting depth. A 4-byte prefix
-  claiming gigabytes is rejected on the spot rather than turned into an
-  allocation first.
-- **Every typed payload parser (`have`, `request`, `piece`) validates a
-  peer's numbers against this torrent's actual piece count and piece
-  length before trusting them.** A peer's request is input, not fact — an
-  out-of-range piece index or a block that overruns its piece boundary is
-  exactly the kind of malformed message that turns into an out-of-bounds
-  panic if it reaches an array unchecked.
-- **A piece bitfield's bit order (piece 0 = the first byte's MSB) is
-  pinned by an exhaustive test**, not a couple of spot checks. Getting
-  this backwards produces no clear symptom — pieces just look
-  unavailable at seemingly random indices — so the test sets every bit
-  in a small bitfield individually and confirms only that exact index
-  reads back true.
-- **The connection is wrapped in a buffered reader specifically to avoid
-  a syscall per message.** Without it, a message's 4-byte length prefix
-  and its body are two separate reads, each a user-space/kernel-space
-  transition; across every message in a real download that adds up to a
-  measurable, avoidable cost for no benefit. The buffered reader is
-  explicitly single-goroutine-owned — it isn't safe to share, which lines
-  up with each connection eventually belonging to exactly one goroutine.
-- **Message reads are tested against both ways TCP actually behaves, not
-  just the happy path of one message per read.** Two whole messages
-  arriving in a single underlying read, and a single message arriving
-  split across three separate writes, are both explicitly covered — this
-  is the exact class of bug that never reproduces on a fast local network
-  and shows up constantly against a real, slightly slow peer.
-- **An unrecognized message ID parses successfully instead of erroring.**
-  `ReadMessage`'s job is framing — knowing where a message ends — not
-  understanding every ID that could ever appear on the wire. Rejecting
-  unfamiliar IDs would drop the connection on any peer using an extension
-  message this client doesn't implement yet, which is the wrong trade for
-  a protocol designed to be extended.
-- **Manually verified against a real peer from a live swarm**: handshake,
-  a full bitfield (3020/3020 pieces for the Debian torrent), a sent
-  `interested`, and a received `unchoke` — a complete conversation
-  exercising every message type this phase introduces, not just the
-  individual pieces in isolation.
+Serialization and parsing are pure functions, kept completely separate
+from the network code that uses them. `Handshake.Serialize` and
+`ParseHandshake` take and return bytes; neither touches a socket. A
+wire-format bug shows up as a plain byte-comparison test failure instead
+of a flaky-looking network test, the same separation `bencode`'s
+encoder/decoder and `metainfo`'s parser already lean on, applied here
+for the first time to something a socket carries.
+
+The connection logic splits into a public `Dial`, which owns the TCP
+connection, and an internal `handshakeOver`, which owns the handshake
+exchange over any `net.Conn`. Production code never sees that split; it
+exists so tests can hand `handshakeOver` one end of an in-memory
+`net.Pipe` instead of a real socket and simulate failure modes — a
+mismatched info hash, a wrong protocol string, a peer that disconnects
+mid-handshake, one that never responds at all — that would be
+impractical to trigger against a real connection on demand.
+
+One deadline covers the dial, and a separate one covers the full
+handshake exchange, both the write and the read. A deadline set only
+before the read would still let a peer that accepts a connection and
+never reads hang the write, since a full send buffer blocks `Write` too.
+That handshake deadline gets explicitly cleared the moment the exchange
+succeeds — leaving it in place is the kind of bug that doesn't show up
+until much later, when the same stale deadline fires in the middle of
+unrelated work and looks like an unrelated, intermittent failure.
+
+Connection-refused, handshake timeout, protocol mismatch, and info-hash
+mismatch are distinguishable outcomes, not one generic error. Most
+addresses a tracker hands back belong to peers that are offline,
+unreachable, or gone, which is normal, not a bug — and the only way to
+tell "the swarm is mostly dead right now" from "my handshake code is
+broken" is if the failure reasons stay visible instead of collapsing
+into one message.
+
+`handshakeTimeout` is a package variable rather than a constant purely
+so tests can shrink it. A test proving a slow or silent peer triggers a
+timeout still has to wait for that timeout to fire, and letting the test
+override the duration is the difference between it taking 50
+milliseconds and taking 5 seconds for the same coverage. A related trap:
+`net.Pipe`'s two ends aren't independent the way two ends of a real TCP
+connection are. Closing one side makes deadline and I/O calls on the
+other side start failing too, which real sockets don't do. A test that
+closes its fake peer's end right after writing a response can race the
+code under test if that code is still finishing up (clearing its own
+deadline, say) on the other end — the fix is for the test to simply not
+close early, not to add synchronization the production code doesn't
+need.
+
+Dialing every address a real tracker returned for a real torrent
+completed handshakes with a mix of real BitTorrent clients (qBittorrent,
+Transmission, Deluge, libtorrent) at roughly the success rate the design
+expects, with every failure falling cleanly into one of the categories
+above rather than an unexplained one.
+
+Keep-alive gets a sentinel message ID rather than being represented as
+`nil`. Returning `nil, nil` from a read function is a classic Go
+footgun — every caller has to remember to check for it, and once
+connections run concurrently, the one caller that forgets is a
+nil-pointer panic waiting to happen. A sentinel keeps keep-alive as just
+another case in an exhaustive switch, which the type system helps
+enforce and a missed check can't silently compile away.
+
+Message framing guards the length prefix before allocating a buffer for
+it, the same guard-before-allocate discipline `bencode` established for
+string lengths and nesting depth — a 4-byte prefix claiming gigabytes
+gets rejected on the spot instead of turning into an allocation first.
+Every typed payload parser (`have`, `request`, `piece`) validates a
+peer's numbers against this torrent's actual piece count and piece
+length before trusting them, since a peer's request is input, not fact;
+an out-of-range piece index or a block that overruns its piece boundary
+is exactly the kind of message that turns into an out-of-bounds panic if
+it reaches an array unchecked.
+
+A piece bitfield's bit order — piece 0 is the first byte's MSB — is
+pinned by an exhaustive test rather than a couple of spot checks.
+Getting this backwards produces no clear symptom (pieces just look
+unavailable at seemingly random indices), so the test sets every bit in
+a small bitfield individually and confirms only that exact index reads
+back true.
+
+The connection wraps a buffered reader specifically to avoid a syscall
+per message. Without it, a message's 4-byte length prefix and its body
+are two separate reads, each a user-space/kernel-space transition, and
+across every message in a real download that adds up. The buffered
+reader is explicitly single-goroutine-owned — not safe to share — which
+lines up with each connection eventually belonging to exactly one
+goroutine.
+
+Message reads are tested against both ways TCP actually behaves, not
+just the happy path of one message per read: two whole messages arriving
+in a single underlying read, and a single message arriving split across
+three separate writes. That's the exact class of bug that never
+reproduces on a fast local network and shows up constantly against a
+real, slightly slow peer. An unrecognized message ID parses successfully
+rather than erroring, since `ReadMessage`'s job is framing — knowing
+where a message ends — not understanding every ID that could appear on
+the wire; rejecting unfamiliar IDs would drop the connection on any peer
+using an extension message this client doesn't implement yet.
+
+Manually verified against a real peer from a live swarm: handshake, a
+full bitfield (3020/3020 pieces for the Debian torrent), a sent
+`interested`, a received `unchoke` — a complete conversation exercising
+every message type this layer adds, not just the pieces in isolation.
 
 ### internal/piece
 
-Piece and block boundary math, plus SHA-1 verification. Every function is
-pure — bytes and integers in, a value out, no I/O — so the geometry that
-every other layer depends on can be tested exhaustively in isolation.
+Piece and block boundary math, plus SHA-1 verification. Every function
+is pure — bytes and integers in, a value out, no I/O — so the geometry
+everything else depends on can be tested exhaustively on its own.
 
-- **One set of geometry functions, used everywhere a piece or block
-  boundary is needed** — requesting, validating an incoming block,
-  sizing a buffer. Duplicating this math at each call site would let an
-  off-by-one fix land in one place and silently miss the others.
-- **The last piece's length is a first-class test case, not an
-  afterthought.** It's shorter than every other piece unless the total
-  length happens to divide evenly — the exact-multiple case is the trap,
-  since a naive remainder calculation returns 0 for it instead of a full
-  piece.
-- **`Work` (immutable) and `Progress` (mutable, single-goroutine) are
-  separate types**, not one struct. `Work` travels across the worker
-  channel in Phase 7 and must never be mutated by two goroutines at once;
-  keeping the in-flight buffer and byte counters out of it entirely
-  removes the possibility instead of relying on discipline.
-- **SHA-1 is used because the BitTorrent v1 spec requires it, not as a
-  security choice** — it's cryptographically broken, and the code and
-  README both say so explicitly, since it's the first thing a reviewer
-  will flag.
+One set of geometry functions handles every place a piece or block
+boundary is needed: building a request, validating an incoming block,
+sizing a buffer. Duplicating that math at each call site would let an
+off-by-one fix land in one place and silently miss the others. The last
+piece's length gets treated as a first-class test case rather than an
+afterthought — it's shorter than every other piece unless the total
+length happens to divide evenly, and that exact-multiple case is the
+trap, since a naive remainder calculation returns 0 for it instead of a
+full piece.
+
+`Work` (immutable) and `Progress` (mutable, single-goroutine) are
+separate types rather than one struct. `Work` travels across the worker
+channel and must never be mutated by two goroutines at once; keeping the
+in-flight buffer and byte counters out of it entirely removes the
+possibility instead of relying on discipline. SHA-1 verifies pieces
+because the BitTorrent v1 spec requires it, not as a security choice —
+it's cryptographically broken, and both the code and the README say so
+explicitly, since it's the first thing a reviewer will flag.
 
 ### internal/download
 
-The only package with full system visibility: it owns the work queue,
+The only package with full system visibility. It owns the work queue,
 every peer worker goroutine, and assembly of verified pieces into the
-final file. Everything below it is mechanism; this is where policy lives.
+final file. Everything below it is mechanism; this is where policy
+lives.
 
-- **A single-piece download (interested → unchoke → pipelined block
-  requests → assemble → verify) is one function, reused unchanged by
-  every concurrent worker** — Phase 7 added concurrency around this
-  function, not inside it.
-- **Up to five block requests are pipelined per piece**, so round-trip
-  latency overlaps across blocks instead of serializing one request at a
-  time behind it — a fixed starting point, flagged for later tuning.
-- **A choking peer resets in-flight request bookkeeping immediately.** A
-  choke silently drops every request already sent; anything still
-  counted as in-flight has to be treated as lost right away, or the
-  download stalls waiting for answers that are never coming.
-- **A piece download has three timeouts, not one**: an overall cap, plus
-  a shorter idle-read deadline that resets on every block actually
-  received — so a slow-but-progressing peer survives, and only a
-  genuinely stalled one gets dropped.
-- **Concurrency is a plain work queue (Design A), not a coordinator.**
-  One channel, pre-filled with every piece, buffered to exactly the
-  piece count so a worst-case requeue storm can't deadlock. One goroutine
-  per peer; a failed or corrupt piece goes back on the queue for another
-  peer to try — recovery comes from the architecture, not explicit retry
-  logic.
-- **Every worker send that isn't provably safe races `ctx.Done()` in a
-  `select`.** `workCh`'s buffer is sized to make its sends safe by
-  construction; `resultCh`'s is not, so its send has to be cancellable or
-  a worker finishing at the wrong moment during shutdown can hang
-  `Download` forever.
-- **A worker's panic is recovered, loudly** — full stack trace at error
-  level plus a running count — so one bad peer can't take down every
-  other in-progress connection, and the failure still can't go unnoticed
-  during development.
-- **Progress counters are atomic where multiple workers touch them
-  (bytes, active/peak peers, connect stats, hash failures, panics), and
-  otherwise owned by `Download`'s main goroutine alone** (pieces done,
-  the rate window) — the same ownership-over-locking principle applied
-  throughout this codebase.
-- **Progress is printed from exactly one place**: a ticker in
-  `Download`'s own select loop. Workers never print directly — a hundred
-  goroutines writing to stdout independently would produce unreadable,
-  interleaved garbage.
+A single-piece download — interested, unchoke, pipelined block requests,
+assemble, verify — is one function, reused unchanged by every concurrent
+worker. Concurrency was added around this function, not inside it. Up
+to five block requests get pipelined per piece, so round-trip latency
+overlaps across blocks instead of serializing one request at a time
+behind it; the number is a fixed starting point, flagged for later
+tuning. A choking peer resets in-flight request bookkeeping immediately,
+since a choke silently drops every request already sent, and anything
+still counted as in-flight has to be treated as lost right away or the
+download stalls waiting on answers that will never come. A piece
+download carries three timeouts, not one: an overall cap, plus a
+shorter idle-read deadline that resets on every block actually received,
+so a slow-but-progressing peer survives and only a genuinely stalled one
+gets dropped.
+
+Concurrency itself is a plain work queue (Design A), not a coordinator.
+One channel is pre-filled with every piece up front, buffered to exactly
+the piece count so a worst-case requeue storm can't deadlock. One
+goroutine runs per peer; a failed or corrupt piece goes back onto the
+queue for another peer to try, so recovery comes from the architecture
+rather than explicit retry logic. Every worker send that isn't provably
+safe races `ctx.Done()` in a `select` — `workCh`'s buffer is sized to
+make its sends safe by construction, but `resultCh`'s isn't, so its send
+has to be cancellable or a worker finishing at the wrong moment during
+shutdown can hang `Download` forever. A worker's panic is recovered,
+loudly (full stack trace at error level, plus a running count), so one
+bad peer can't take down every other in-progress connection and the
+failure still doesn't go unnoticed during development.
+
+Progress counters are atomic wherever multiple workers touch them —
+bytes, active and peak peers, connect stats, hash failures, panics — and
+otherwise owned by `Download`'s main goroutine alone (pieces done, the
+rate window), the same ownership-over-locking principle applied
+throughout this codebase. Progress is printed from exactly one place, a
+ticker inside `Download`'s own select loop; workers never print
+directly, since a hundred goroutines writing to stdout independently
+would produce unreadable, interleaved output.
+
+Resume is a filter on the work queue rather than a separate code path.
+`Download` calls `storage.VerifyExisting` once at startup; anything
+already verified gets marked in the `have` bitfield and simply never
+added to `work` in the first place. There's no "skip this piece" branch
+anywhere downstream — a piece that's already done was never a candidate
+for downloading to begin with. Resumed pieces still have to be reported
+to `Progress` explicitly, though: the loop counter (`completed`) starts
+at the resumed count correctly, but `Progress.piecesDone` is a separate
+field that only advances when `PieceCompleted` is called. Missing that
+call for resumed pieces was a real bug caught during manual testing —
+the loop itself worked fine, but `Percent()` and `ETA()` still read 0%
+at the start of a resumed run, because two counters that need to move
+together are an easy thing to under-update. The final throughput figure
+divides by bytes actually transferred this session
+(`Progress.BytesDownloaded()`) rather than the torrent's total size, for
+a related reason: a resumed download's elapsed time only covers the
+pieces it actually fetched, so dividing the whole file's size by that
+time would overstate throughput by however much resume skipped.
+
+### internal/storage
+
+Owns all on-disk I/O for a download: preallocating the output file,
+writing each verified piece to its correct offset, and reading pieces
+back, both for resume verification and, later, for seeding. It never
+decides which piece to download next; that policy stays in `download`.
+
+The output file is preallocated once, up front, to its full final size,
+rather than grown piece by piece. That makes every later piece write a
+plain positional write into already-sized space, and it fails fast if
+the disk can't hold the file at all, well before a large download would
+otherwise discover that at 99%. That preallocation is a sparse file, not
+a real disk-block reservation — `Truncate` sets the file's size in
+metadata, and disk blocks only get allocated as each region is actually
+written. That's portable through the standard library alone; real
+preallocation needs OS-specific syscalls (`fallocate`, `F_PREALLOCATE`,
+`SetFileValidData`), which would cost the project's zero-dependency,
+single-code-path approach for a guarantee that's rarely worth it in
+practice. The trade-off is honest: a full disk gets discovered on the
+write that actually hits it, not at file-creation time.
+
+Buffered writes get synced to disk exactly once, at completion, never
+per piece. `fsync` on every piece would serialize the whole download
+behind disk latency, and a crash before that final sync just means
+whatever wasn't yet flushed gets caught and re-downloaded by resume
+verification anyway. Correctness comes from re-verifying on resume, not
+from fsync discipline, which is exactly what makes skipping per-piece
+fsync safe.
+
+Resume keeps no separate metadata file recording completion. Two
+designs were possible: track "pieces done" in a side file, or re-verify
+against the data itself. A side file can drift out of sync with what's
+actually on disk — a crash, a user editing the file, a disk error — and
+that leaves two sources of truth that can disagree. Re-hashing every
+piece against the `.torrent`'s expected hashes has no such failure mode:
+whatever the data proves is correct by definition, because it's the same
+check every downloaded piece already has to pass.
+
+The resume scan itself is bounded-parallel rather than one goroutine per
+piece. A torrent with tens of thousands of pieces would otherwise turn a
+startup scan into a random-access I/O storm and spike memory with that
+many in-flight read buffers at once. A semaphore sized to
+`runtime.NumCPU()` keeps disk and SHA-1 work both busy without that. And
+a missing file gets the same response as a wrong-size or corrupt one:
+every piece treated as not-yet-downloaded. Guessing at a partial match
+for a file that isn't even the right size risks reading out of bounds or
+verifying against the wrong bytes entirely — the same all-or-nothing
+caution this project applies to every other untrusted or unexpected
+input.
