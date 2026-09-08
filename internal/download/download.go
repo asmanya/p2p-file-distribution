@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/asmanya/p2p-file-distribution/internal/metainfo"
+	"github.com/asmanya/p2p-file-distribution/internal/peer"
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
 	"github.com/asmanya/p2p-file-distribution/internal/storage"
 	"github.com/asmanya/p2p-file-distribution/internal/tracker"
@@ -26,10 +27,38 @@ const listenPort = 6881
 // worth re-announcing to the tracker for a fresh peer list.
 const stallTimeout = 30 * time.Second
 
+// HaveBitfield tracks which pieces are already verified and on disk - the source of truth this client can seed from
+// (phase 10) and what resume uses to skip pieces it doesn't need to re-download. It's written from Download's main
+// goroutine as pieces complete, and will be read from other goroutines once seeding exists - a mutex is simplest and this
+// struct is neither large nor hot enough to need anything fancier.
+type HaveBitfield struct {
+	mu sync.Mutex
+	bf peer.Bitfield
+}
+
+func NewHaveBitfield(pieceCount int) *HaveBitfield {
+	return &HaveBitfield{bf: make(peer.Bitfield, (pieceCount+7)/8)}
+}
+
+func (h *HaveBitfield) Set(index int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.bf.SetPiece(index)
+}
+
+func (h *HaveBitfield) Has(index int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.bf.HasPiece(index)
+}
+
 // Download concurrently downloads every piece of tor, one worker goroutine per connected peer, and writes each verified
 // piece straight to outputPath at its correct offset. It announces to tc once up front, and again - no more often than the
 // tracker's own minimum interval allows - whenever no piece has completed for stallTimeout, so a torrent doesn't get
 // stuck forever on whatever peers happened to be in the first response.
+//
+// Before requesting anything, it verifies whatever data already exists at outputPath and skips pieces that already match
+// their expected hash - this is the entire resume mechanism, with no separate metadata file.
 func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, peerID [20]byte, outputPath string) error {
 	start := time.Now()
 	pieceCount := tor.PieceCount()
@@ -41,18 +70,31 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	}
 	defer sf.Close()
 
-	// creating the queue
-	work := make([]piece.Work, pieceCount)
+	verifiedPieces, err := storage.VerifyExisting(outputPath, pieceCount, tor.PieceLength, tor.TotalLength, tor.PiecesHashes)
+	if err != nil {
+		return fmt.Errorf("download: verify existing data: %w", err)
+	}
+
+	have := NewHaveBitfield(pieceCount)
+	completed := 0
+
+	// creating the queue - already-verified pieces are never added, so there's nothing to "skip" at request time
+	work := make([]piece.Work, 0, pieceCount)
 	for i := 0; i < pieceCount; i++ {
+		if verifiedPieces[i] {
+			have.Set(i)
+			completed++
+			continue
+		}
 		length, err := piece.Length(i, pieceCount, tor.PieceLength, tor.TotalLength)
 		if err != nil {
 			return err
 		}
-		work[i] = piece.Work{
+		work = append(work, piece.Work{
 			Index:        i,
 			ExpectedHash: tor.PiecesHashes[i][:],
 			Length:       length,
-		}
+		})
 	}
 
 	workCh, resultCh := NewQueues(work)
@@ -107,7 +149,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	progressTicker := time.NewTicker(progressLogInterval)
 	defer progressTicker.Stop()
 
-	for completed := 0; completed < pieceCount; {
+	for completed < pieceCount {
 		select {
 		case <-ctx.Done():
 			cancel()
@@ -127,6 +169,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			if err := sf.WritePiece(result.Index, pieceCount, tor.PieceLength, tor.TotalLength, result.Data); err != nil {
 				return fmt.Errorf("download: write piece %d: %w", result.Index, err)
 			}
+			have.Set(result.Index)
 			completed++
 			progress.PieceCompleted()
 			lastProgress = time.Now()
