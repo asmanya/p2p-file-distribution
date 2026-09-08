@@ -84,6 +84,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 		if verifiedPieces[i] {
 			have.Set(i)
 			completed++
+			progress.PieceCompleted() // so Percent()/ETA() reflect resumed progress from the start, not just this session's
 			continue
 		}
 		length, err := piece.Length(i, pieceCount, tor.PieceLength, tor.TotalLength)
@@ -95,6 +96,10 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			ExpectedHash: tor.PiecesHashes[i][:],
 			Length:       length,
 		})
+	}
+
+	if completed > 0 {
+		slog.Info("resume: found existing verified data", "pieces_already_done", completed, "pieces_remaining", pieceCount-completed)
 	}
 
 	workCh, resultCh := NewQueues(work)
@@ -203,7 +208,9 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	}
 	slog.Info("download complete",
 		"elapsed", elapsed.Round(time.Second),
-		"avg_throughput_kib_s", fmt.Sprintf("%.1f", float64(tor.TotalLength)/elapsed.Seconds()/1024),
+		// progress.BytesDownloaded(), not tor.TotalLength - a resumed download's elapsed time only covers the bytes
+		// actually fetched this session, not the whole file, so dividing by the full size would overstate throughput.
+		"avg_throughput_kib_s", fmt.Sprintf("%.1f", float64(progress.BytesDownloaded())/elapsed.Seconds()/1024),
 		"peak_peers", progress.PeakPeers(),
 		"connect_success_rate", fmt.Sprintf("%.0f%% (%d/%d)", successRate, successes, attempts),
 		"hash_failures", progress.HashFailures(),
