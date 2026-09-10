@@ -34,15 +34,16 @@ func (c *Coordinator) maybeEnterEndgame() {
 	}
 }
 
-// assignAnyMissingTo gives an idle peer p one still-missing piece it has, ignoring whether some other peer is already
-// downloading it - endgame turns duplicate prevention off deliberately. A no-op if p is busy or has none of the remaining
-// pieces; called again the moment p becomes ready.
+// assignAnyMissingTo gives an idle peer p one still-incomplete piece it has, ignoring whether some other peer is
+// already downloading it - endgame turns duplicate prevention off deliberately, so a piece already in flight to
+// someone else is still a valid target (only a piece that's actually done is excluded). A no-op if p is busy or has
+// none of the remaining pieces; called again the moment p becomes ready.
 func (c *Coordinator) assignAnyMissingTo(addr netip.AddrPort, p *peerInfo) {
 	if p.assigned >= 0 {
 		return
 	}
 	for index, state := range c.pieces {
-		if state != pieceMissing || p.have.HasPiece(index) {
+		if state == pieceComplete || !p.have.HasPiece(index) {
 			continue
 		}
 		if c.sendAssignCommand(addr, p, index) {
