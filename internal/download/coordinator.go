@@ -38,7 +38,9 @@ type Coordinator struct {
 	pieces       []pieceState
 	availability []int
 	peers        map[netip.AddrPort]*peerInfo
-	assignments  map[int]netip.AddrPort // piece index -> holder, in flight pieces only
+	assignments  map[int][]netip.AddrPort // piece index -> holder, in flight pieces only
+	assignedAt   map[int]time.Time        // piece index -> when it was assigned, for timeout detection
+	endgame      bool
 
 	events  chan Event
 	results chan<- Result
@@ -54,9 +56,10 @@ func NewCoordinator(pieceCount int, pieceLength, totalLength int64, results chan
 		pieces:       make([]pieceState, pieceCount),
 		availability: make([]int, pieceCount),
 		peers:        make(map[netip.AddrPort]*peerInfo),
-		assignments:  make(map[int]netip.AddrPort),
+		assignments:  make(map[int][]netip.AddrPort),
 		events:       make(chan Event),
 		results:      results,
+		assignedAt:   make(map[int]time.Time),
 	}
 }
 
@@ -132,8 +135,13 @@ func (c *Coordinator) handleHaveReceived(e HaveReceived) {
 }
 
 func (c *Coordinator) handlePieceDownloaded(ctx context.Context, e PieceDownloaded) {
+	if c.pieces[e.Index] == pieceComplete {
+		return // already completed by someone else after this one timed out - ignore the late duplicate
+	}
 	c.pieces[e.Index] = pieceComplete
+	c.cancelOtherAssignees(e.Index, e.Addr)
 	delete(c.assignments, e.Index)
+	delete(c.assignedAt, e.Index)
 	if p, ok := c.peers[e.Addr]; ok {
 		p.assigned = -1
 	}
@@ -145,8 +153,10 @@ func (c *Coordinator) handlePieceDownloaded(ctx context.Context, e PieceDownload
 }
 
 func (c *Coordinator) handlePieceFailed(e PieceFailed) {
+	c.removeAssignee(e.Index, e.Addr)
 	c.pieces[e.Index] = pieceMissing
 	delete(c.assignments, e.Index)
+	delete(c.assignedAt, e.Index)
 	if p, ok := c.peers[e.Addr]; ok {
 		p.assigned = -1
 	}
@@ -155,6 +165,10 @@ func (c *Coordinator) handlePieceFailed(e PieceFailed) {
 func (c *Coordinator) handlePeerReady(e PeerReady) {
 	p, ok := c.peers[e.Addr]
 	if !ok {
+		return
+	}
+	if c.endgame {
+		c.assignAnyMissingTo(e.Addr, p)
 		return
 	}
 	index, found := c.selectPieceFor(p.have)
@@ -172,12 +186,28 @@ func (c *Coordinator) handlePeerLeft(e PeerLeft) {
 	c.removeAvailability(p.have)
 
 	if p.assigned >= 0 {
-		c.pieces[p.assigned] = pieceMissing
-		delete(c.assignments, p.assigned)
+		c.removeAssignee(p.assigned, e.Addr)
+		if len(c.assignments[p.assigned]) == 0 {
+			c.pieces[p.assigned] = pieceMissing
+			delete(c.assignedAt, p.assigned)
+		}
 	}
 	delete(c.peers, e.Addr)
 }
 
 func (c *Coordinator) tick() {
-	// stall detection / stats - filled in as later steps need it.
+	c.freeStaleAssignments()
+	c.maybeEnterEndgame()
+}
+
+// removeAssignee drops addr from index's assignee list, if present - used whenever a peer stops downloading a piece,
+// for any reason (fail, leave, timeout, cancelled).
+func (c *Coordinator) removeAssignee(index int, addr netip.AddrPort) {
+	assignees := c.assignments[index]
+	for i, a := range assignees {
+		if a == addr {
+			c.assignments[index] = append(assignees[:i], assignees[i+1:]...)
+			return
+		}
+	}
 }
