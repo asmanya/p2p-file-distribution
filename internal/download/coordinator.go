@@ -32,12 +32,13 @@ type peerInfo struct {
 // are connected, dnd what's currently in flight. All of it lives inside Run's goroutine and is reached only through events
 // - nothing here is guarded by a mutex, becuase no other goroutine ever touches it.
 type Coordinator struct {
-	pieceCount int
+	pieceCount               int
+	pieceLength, totalLength int64
 
-	pieces        []pieceState
-	availablility []int
-	peers         map[netip.AddrPort]*peerInfo
-	assignments   map[int]netip.AddrPort // piece index -> holder, in flight pieces only
+	pieces       []pieceState
+	availability []int
+	peers        map[netip.AddrPort]*peerInfo
+	assignments  map[int]netip.AddrPort // piece index -> holder, in flight pieces only
 
 	events  chan Event
 	results chan<- Result
@@ -45,15 +46,17 @@ type Coordinator struct {
 
 // NewCoordinator builds a coordinator ready to Run. results is where completed pieces get handed off for disk writes - the
 // coordinator itself never touches disk.
-func NewCoordinator(pieceCount int, results chan<- Result) *Coordinator {
+func NewCoordinator(pieceCount int, pieceLength, totalLength int64, results chan<- Result) *Coordinator {
 	return &Coordinator{
-		pieceCount:    pieceCount,
-		pieces:        make([]pieceState, pieceCount),
-		availablility: make([]int, pieceCount),
-		peers:         make(map[netip.AddrPort]*peerInfo),
-		assignments:   make(map[int]netip.AddrPort),
-		events:        make(chan Event),
-		results:       results,
+		pieceCount:   pieceCount,
+		pieceLength:  pieceLength,
+		totalLength:  totalLength,
+		pieces:       make([]pieceState, pieceCount),
+		availability: make([]int, pieceCount),
+		peers:        make(map[netip.AddrPort]*peerInfo),
+		assignments:  make(map[int]netip.AddrPort),
+		events:       make(chan Event),
+		results:      results,
 	}
 }
 
@@ -113,11 +116,7 @@ func (c *Coordinator) handleBitfieldReceived(e BitfieldReceived) {
 		return
 	}
 	p.have = e.Bitfield
-	for i := 0; i < c.pieceCount; i++ {
-		if p.have.HasPiece(i) {
-			c.availablility[i]++
-		}
-	}
+	c.addAvailability(p.have)
 }
 
 func (c *Coordinator) handleHaveReceived(e HaveReceived) {
@@ -129,7 +128,7 @@ func (c *Coordinator) handleHaveReceived(e HaveReceived) {
 		return // redundant have - already counted, dont inflate availability
 	}
 	p.have.SetPiece(e.Index)
-	c.availablility[e.Index]++
+	c.incAvailability(e.Index)
 }
 
 func (c *Coordinator) handlePieceDownloaded(ctx context.Context, e PieceDownloaded) {
@@ -154,8 +153,15 @@ func (c *Coordinator) handlePieceFailed(e PieceFailed) {
 }
 
 func (c *Coordinator) handlePeerReady(e PeerReady) {
-	// which piece (if any) to assign this peer (rarest-first algorithm) - nothing to do yet
-	_ = e
+	p, ok := c.peers[e.Addr]
+	if !ok {
+		return
+	}
+	index, found := c.selectPieceFor(p.have)
+	if !found {
+		return // nothign useful for this peer right now
+	}
+	c.AssignPiece(e.Addr, p, index)
 }
 
 func (c *Coordinator) handlePeerLeft(e PeerLeft) {
@@ -163,11 +169,8 @@ func (c *Coordinator) handlePeerLeft(e PeerLeft) {
 	if !ok {
 		return
 	}
-	for i := 0; i < c.pieceCount; i++ {
-		if p.have.HasPiece(i) {
-			c.availablility[i]--
-		}
-	}
+	c.removeAvailability(p.have)
+
 	if p.assigned >= 0 {
 		c.pieces[p.assigned] = pieceMissing
 		delete(c.assignments, p.assigned)
