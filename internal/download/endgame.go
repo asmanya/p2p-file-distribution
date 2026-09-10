@@ -67,6 +67,7 @@ func (c *Coordinator) cancelOtherAssignees(index int, winner netip.AddrPort) {
 		}
 		select {
 		case p.commands <- CancelPiece{Index: index}:
+			c.progress.DuplicateAssignment()
 		default:
 			// channel full - the peer finds out this piece is done some other way (finishes and gets the pieceComplete guard,
 			// or its own state catches up later.)

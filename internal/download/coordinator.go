@@ -45,11 +45,13 @@ type Coordinator struct {
 
 	events  chan Event
 	results chan<- Result
+
+	progress *Progress
 }
 
 // NewCoordinator builds a coordinator ready to Run. results is where completed pieces get handed off for disk writes - the
-// coordinator itself never touches disk.
-func NewCoordinator(pieceCount int, pieceLength, totalLength int64, pieceHashes [][20]byte, results chan<- Result) *Coordinator {
+// coordinator itself never touches disk. progress may be nil - every Progress method is a safe no-op on a nil receiver.
+func NewCoordinator(pieceCount int, pieceLength, totalLength int64, pieceHashes [][20]byte, results chan<- Result, progress *Progress) *Coordinator {
 	return &Coordinator{
 		pieceCount:   pieceCount,
 		pieceLength:  pieceLength,
@@ -62,6 +64,7 @@ func NewCoordinator(pieceCount int, pieceLength, totalLength int64, pieceHashes 
 		events:       make(chan Event),
 		results:      results,
 		assignedAt:   make(map[int]time.Time),
+		progress:     progress,
 	}
 }
 
@@ -156,9 +159,10 @@ func (c *Coordinator) handlePieceDownloaded(ctx context.Context, e PieceDownload
 
 func (c *Coordinator) handlePieceFailed(e PieceFailed) {
 	c.removeAssignee(e.Index, e.Addr)
-	c.pieces[e.Index] = pieceMissing
-	delete(c.assignments, e.Index)
-	delete(c.assignedAt, e.Index)
+	if len(c.assignments[e.Index]) == 0 {
+		c.pieces[e.Index] = pieceMissing
+		delete(c.assignedAt, e.Index)
+	}
 	if p, ok := c.peers[e.Addr]; ok {
 		p.assigned = -1
 	}

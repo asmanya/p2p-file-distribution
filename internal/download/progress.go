@@ -25,6 +25,8 @@ type Progress struct {
 	hashFailures int64 // atomic - pieces that downloaded fully but failed SHA-1 verification
 	panics       int64 // atomic - worker goroutines that recovered from a panic
 
+	duplicateAssignments int64 // atomic - endgame assignments cancelled because another peer finished first
+
 	piecesDone int
 	samples    []rateSample
 }
@@ -144,6 +146,21 @@ func (p *Progress) Panics() int64 {
 		return 0
 	}
 	return atomic.LoadInt64(&p.panics)
+}
+
+// DuplicateAssignment records one endgame assignment that got cancelled because another peer finished the same
+// piece first - a measured proxy for bandwidth spent on redundant requests, not an estimate.
+func (p *Progress) DuplicateAssignment() {
+	if p != nil {
+		atomic.AddInt64(&p.duplicateAssignments, 1)
+	}
+}
+
+func (p *Progress) DuplicateAssignments() int64 {
+	if p == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&p.duplicateAssignments)
 }
 
 // PieceCompleted records that one more piece finished and takes a rate sample. Must only be called from the

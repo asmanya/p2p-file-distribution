@@ -1,6 +1,7 @@
 package download
 
 import (
+	"log/slog"
 	"math/rand/v2"
 	"net/netip"
 	"time"
@@ -65,6 +66,13 @@ func (c *Coordinator) sendAssignCommand(addr netip.AddrPort, p *peerInfo, index 
 	if _, ok := c.assignedAt[index]; !ok {
 		c.assignedAt[index] = time.Now()
 	}
+
+	slog.Debug("coordinator: assigned piece",
+		"index", index,
+		"peer", addr,
+		"availability", c.availability[index],
+		"endgame", c.endgame,
+	)
 	return true
 }
 

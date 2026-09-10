@@ -78,7 +78,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	completed := 0
 
 	resultCh := make(chan Result, resultsBufferSize)
-	coordinator := NewCoordinator(pieceCount, tor.PieceLength, tor.TotalLength, tor.PiecesHashes, resultCh)
+	coordinator := NewCoordinator(pieceCount, tor.PieceLength, tor.TotalLength, tor.PiecesHashes, resultCh, progress)
 
 	// already-verified pieces are marked complete before Run starts - nothing to "skip" at request time, the
 	// coordinator simply never offers them to anyone
@@ -211,6 +211,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 		"connect_success_rate", fmt.Sprintf("%.0f%% (%d/%d)", successRate, successes, attempts),
 		"hash_failures", progress.HashFailures(),
 		"panics_recovered", progress.Panics(),
+		"duplicate_assignments", progress.DuplicateAssignments(),
 	)
 
 	return nil

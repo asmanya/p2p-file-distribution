@@ -19,7 +19,7 @@ import (
 // care about piece indices and coordinator state, never about geometry or actual verification.
 func newTestCoordinator(pieceCount int) (*Coordinator, chan Result) {
 	results := make(chan Result, pieceCount)
-	return NewCoordinator(pieceCount, 1, int64(pieceCount), make([][20]byte, pieceCount), results), results
+	return NewCoordinator(pieceCount, 1, int64(pieceCount), make([][20]byte, pieceCount), results, nil), results
 }
 
 // bitfieldOf builds a peer.Bitfield with exactly the given piece indices set.
