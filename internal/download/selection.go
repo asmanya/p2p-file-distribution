@@ -55,7 +55,7 @@ func (c *Coordinator) sendAssignCommand(addr netip.AddrPort, p *peerInfo, index 
 	}
 
 	select {
-	case p.commands <- AssignPiece{Index: index, Length: length}:
+	case p.commands <- AssignPiece{Index: index, Length: length, ExpectedHash: c.pieceHashes[index][:]}:
 	default:
 		return false
 	}

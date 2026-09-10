@@ -71,8 +71,9 @@ type Command interface {
 
 // AssignPiece assigns one piece to the worker.
 type AssignPiece struct {
-	Index  int
-	Length int64
+	Index        int
+	Length       int64
+	ExpectedHash []byte
 }
 
 // CancelPiece tells the worker to abandon an in-flight request - used by endgame mode once another peer finishes the same piece first.

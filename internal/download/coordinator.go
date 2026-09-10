@@ -34,6 +34,7 @@ type peerInfo struct {
 type Coordinator struct {
 	pieceCount               int
 	pieceLength, totalLength int64
+	pieceHashes              [][20]byte
 
 	pieces       []pieceState
 	availability []int
@@ -48,11 +49,12 @@ type Coordinator struct {
 
 // NewCoordinator builds a coordinator ready to Run. results is where completed pieces get handed off for disk writes - the
 // coordinator itself never touches disk.
-func NewCoordinator(pieceCount int, pieceLength, totalLength int64, results chan<- Result) *Coordinator {
+func NewCoordinator(pieceCount int, pieceLength, totalLength int64, pieceHashes [][20]byte, results chan<- Result) *Coordinator {
 	return &Coordinator{
 		pieceCount:   pieceCount,
 		pieceLength:  pieceLength,
 		totalLength:  totalLength,
+		pieceHashes:  pieceHashes,
 		pieces:       make([]pieceState, pieceCount),
 		availability: make([]int, pieceCount),
 		peers:        make(map[netip.AddrPort]*peerInfo),
@@ -210,4 +212,11 @@ func (c *Coordinator) removeAssignee(index int, addr netip.AddrPort) {
 			return
 		}
 	}
+}
+
+// MarkComplete marks index as already downloaded and verified - used once at startup for pieces resume found already correct on
+// disk. Only safe to call before Run starts: there's no event/channel path for it because it only ever runs before the single-owner
+// goroutine exists to race against.
+func (c *Coordinator) MarkComplete(index int) {
+	c.pieces[index] = pieceComplete
 }

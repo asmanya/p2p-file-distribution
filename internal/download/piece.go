@@ -20,6 +20,8 @@ var (
 const backlogLimit = 5 // TODO: adaptive backlog based on peer speed
 
 var ErrUnchokeTimeout = errors.New("download: peer did not unchoke in time")
+var errCancelled = errors.New("download: piece cancelled")
+var errShutdown = errors.New("download: shutdown")
 
 // EnsureUnchoked sends "interested" (if we haven't already declared it) and
 // blocks until the peer unchokes us, or gives up on us.
@@ -30,7 +32,7 @@ var ErrUnchokeTimeout = errors.New("download: peer did not unchoke in time")
 // again before every piece would resend "interested" needlessly and, worse,
 // block waiting for a fresh "unchoke" message a peer that already unchoked
 // us has no reason to send twice.
-func EnsureUnchoked(conn *peer.Conn) error {
+func EnsureUnchoked(conn *peer.Conn, messages <-chan peer.Message) error {
 	if !conn.AmInterested {
 		if err := conn.SendInterested(); err != nil {
 			return fmt.Errorf("download: send interested: %w", err)
@@ -42,7 +44,7 @@ func EnsureUnchoked(conn *peer.Conn) error {
 		return nil // already unchoked - e.g. a prior piece on this same conn
 	}
 
-	return waitForUnchoke(conn)
+	return waitForUnchoke(conn, messages)
 }
 
 // Piece downloads a single piece over conn, blocking until the piece is
@@ -54,8 +56,8 @@ func EnsureUnchoked(conn *peer.Conn) error {
 //
 // A choke arriving mid-download is still handled here (see downloadBlocks) -
 // only the *initial* wait for the first unchoke lives in EnsureUnchoked.
-func Piece(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress) ([]byte, error) {
-	buf, err := downloadBlocks(conn, work, pieceCount, progress)
+func Piece(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress, messages <-chan peer.Message, commands <-chan Command, onHave func(index int)) ([]byte, error) {
+	buf, err := downloadBlocks(conn, work, pieceCount, progress, messages, commands, onHave)
 	if err != nil {
 		return nil, err
 	}
@@ -76,30 +78,29 @@ func Piece(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress)
 }
 
 // waitForUnchoke reads messages until the peer unchokes us, or times out.
-func waitForUnchoke(conn *peer.Conn) error {
+func waitForUnchoke(conn *peer.Conn, messages <-chan peer.Message) error {
 	deadline := time.Now().Add(unchokeTimeout)
-	for time.Now().Before(deadline) {
-		if err := conn.SetIODeadline(time.Until(deadline)); err != nil {
-			return fmt.Errorf("download: set deadline: %w", err)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ErrUnchokeTimeout
 		}
-		msg, err := conn.ReadMessage()
-		if err != nil {
+		select {
+		case msg, ok := <-messages:
+			if !ok {
+				return fmt.Errorf("download: %w", ErrUnchokeTimeout)
+			}
+			switch msg.ID {
+			case peer.MsgUnchoke:
+				conn.PeerChoking = false
+				return nil
+			case peer.MsgChoke:
+				conn.PeerChoking = true
+			}
+		case <-time.After(remaining):
 			return fmt.Errorf("download: %w", ErrUnchokeTimeout)
 		}
-
-		switch msg.ID {
-		case peer.MsgUnchoke:
-			conn.PeerChoking = false
-			return nil
-		case peer.MsgChoke:
-			conn.PeerChoking = true
-		case peer.MsgHave, peer.MsgBitfield, peer.MsgKeepAlive:
-			// ignored here - bitfield/have tracking is the caller's job once this function returns; during the
-			// unchoke wait we only care about the choke state
-		}
 	}
-
-	return ErrUnchokeTimeout
 }
 
 // downloadBlocks requests and assembles every block of work, pipelining up
@@ -109,7 +110,7 @@ func waitForUnchoke(conn *peer.Conn) error {
 // reset every time SetIODeadline is called again below, so a peer that's
 // merely slow (but still making progress) survives, while one that's gone
 // silent gets dropped.
-func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress) ([]byte, error) {
+func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress, messages <-chan peer.Message, commands <-chan Command, onHave func(index int)) ([]byte, error) {
 	buf := make([]byte, work.Length)
 	var downloaded int64 // bytes actually copied into buf so far
 	backlog := 0         // requests currently in flight, unanswered
@@ -129,13 +130,6 @@ func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int, progress *
 	pieceDeadline := time.Now().Add(pieceTimeout)
 
 	for downloaded < work.Length {
-		if time.Now().After(pieceDeadline) {
-			return nil, fmt.Errorf("download: piece %d timed out", work.Index)
-		}
-
-		// Top up the backlog before reading. If we're choked, or the
-		// backlog is already full, or there's nothing left to request,
-		// this loop does nothing and we fall straight through to the read.
 		for !conn.PeerChoking && backlog < backlogLimit && nextBlock < numBlocks {
 			offset, length, err := piece.BlockBounds(0, nextBlock, 1, work.Length, work.Length)
 			if err != nil {
@@ -148,47 +142,58 @@ func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int, progress *
 			nextBlock++
 		}
 
-		// Every read gets a fresh readTimeout window - as long as blocks
-		// keep arriving, this deadline keeps getting pushed out, and only
-		// a genuinely stalled peer trips it.
-		if err := conn.SetIODeadline(readTimeout); err != nil {
-			return nil, fmt.Errorf("download: piece %d: %w", work.Index, err)
-		}
-		msg, err := conn.ReadMessage()
-		if err != nil {
-			return nil, fmt.Errorf("download: piece %d: read timeout: %w", work.Index, err)
-		}
-
-		switch msg.ID {
-		case peer.MsgPiece:
-			p, err := peer.ParsePiecePayload(msg.Payload, pieceCount, int(work.Length))
-			if err != nil {
-				return nil, fmt.Errorf("download: piece %d: %w", work.Index, err)
+		select {
+		case msg, ok := <-messages:
+			if !ok {
+				return nil, fmt.Errorf("download: piece %d: connection closed", work.Index)
 			}
-			if p.Index != work.Index {
-				continue // stray block from an unrelated piece, ignore
+			switch msg.ID {
+			case peer.MsgPiece:
+				p, err := peer.ParsePiecePayload(msg.Payload, pieceCount, int(work.Length))
+				if err != nil {
+					return nil, fmt.Errorf("download: piece %d: %w", work.Index, err)
+				}
+				if p.Index != work.Index {
+					continue
+				}
+				copy(buf[p.Begin:], p.Block)
+				downloaded += int64(len(p.Block))
+				progress.AddBytes(len(p.Block))
+				backlog--
+
+			case peer.MsgChoke:
+				conn.PeerChoking = true
+				backlog = 0
+				nextBlock = int(downloaded / piece.BlockSize)
+
+			case peer.MsgUnchoke:
+				conn.PeerChoking = false
+
+			case peer.MsgHave:
+				if h, err := peer.ParseHavePayload(msg.Payload, pieceCount); err == nil {
+					conn.PeerBitfield.SetPiece(h.Index)
+					if onHave != nil {
+						onHave(h.Index)
+					}
+				}
 			}
-			copy(buf[p.Begin:], p.Block)
-			downloaded += int64(len(p.Block))
-			progress.AddBytes(len(p.Block))
-			backlog--
 
-		case peer.MsgChoke:
-			// In-flight requests are silently dropped by a choking peer. Reset backlog and rewind nextBlock to
-			// what's actually downloaded, or we'll wait forever for responses that are never coming.
-			conn.PeerChoking = true
-			backlog = 0
-			nextBlock = int(downloaded / piece.BlockSize)
-
-		case peer.MsgUnchoke:
-			conn.PeerChoking = false
-
-		case peer.MsgHave:
-			if h, err := peer.ParseHavePayload(msg.Payload, pieceCount); err == nil {
-				conn.PeerBitfield.SetPiece(h.Index)
+		case cmd, ok := <-commands:
+			if !ok {
+				return nil, errShutdown
 			}
+			switch c := cmd.(type) {
+			case CancelPiece:
+				if c.Index == work.Index {
+					return nil, errCancelled
+				}
+			case Shutdown:
+				return nil, errShutdown
+			}
+
+		case <-time.After(time.Until(pieceDeadline)):
+			return nil, fmt.Errorf("download: piece %d timed out", work.Index)
 		}
 	}
-
 	return buf, nil
 }
