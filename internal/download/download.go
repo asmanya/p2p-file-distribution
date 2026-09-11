@@ -167,6 +167,19 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 				"eta", progress.ETA(tor.TotalLength).Round(time.Second),
 			)
 
+			// Checked here, on the same 1-second ticker, rather than a separate time.After(stallTimeout) case: a
+			// fresh time.After call re-armed on every trip around this select would never survive the 30 seconds it
+			// needs to fire, because this ticker case wins the select every second and restarts the loop first. A
+			// goroutine per connected peer stuck requesting a piece nobody in the swarm has, or every worker having
+			// died and left nothing behind, is fixed the same way: more peers. Respect the tracker's own minimum
+			// interval so a stall doesn't turn into a rate-limit ban.
+			stalled := time.Since(lastProgress) >= stallTimeout
+			allowedToReannounce := time.Since(lastAnnounce) >= minReannounceInterval
+			if stalled && allowedToReannounce {
+				_ = announce() // best-effort - a failed re-announce just means we try again at the next tick
+				lastAnnounce = time.Now()
+			}
+
 		case result := <-resultCh:
 			if err := sf.WritePiece(result.Index, pieceCount, tor.PieceLength, tor.TotalLength, result.Data); err != nil {
 				return fmt.Errorf("download: write piece %d: %w", result.Index, err)
@@ -175,17 +188,6 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			completed++
 			progress.PieceCompleted()
 			lastProgress = time.Now()
-
-		case <-time.After(stallTimeout):
-			// A goroutine per connected peer is stuck requesting a piece nobody in the swarm has, or every worker
-			// has died and left the queue untouched - either way, more peers are the fix. Respect the tracker's own
-			// minimum interval so a stall doesn't turn into a rate-limit ban.
-			stalled := time.Since(lastProgress) >= stallTimeout
-			allowedToReannounce := time.Since(lastAnnounce) >= minReannounceInterval
-			if stalled && allowedToReannounce {
-				_ = announce() // best-effort - a failed re-announce just means we try again at the next stall check
-				lastAnnounce = time.Now()
-			}
 		}
 	}
 

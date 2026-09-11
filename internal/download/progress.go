@@ -193,6 +193,12 @@ func (p *Progress) Rate() float64 {
 		return 0
 	}
 	first, last := p.samples[0], p.samples[len(p.samples)-1]
+	// recordSample only prunes stale samples when a new one arrives, so during a real stall (no piece completing at
+	// all) the window never advances - without this check, Rate would keep reporting whatever it last computed
+	// instead of admitting nothing recent has happened.
+	if time.Since(last.at) > rateWindow {
+		return 0
+	}
 	elapsed := last.at.Sub(first.at).Seconds()
 	if elapsed <= 0 {
 		return 0
