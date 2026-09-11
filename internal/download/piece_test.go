@@ -92,12 +92,14 @@ func send(t *testing.T, conn net.Conn, msg peer.Message) {
 // the same way a real Dial would after a completed handshake. The returned
 // server end is handed to a fake-seeder goroutine that plays the role of
 // the remote peer for the rest of the test.
-func newTestConn(t *testing.T) (conn *peer.Conn, server net.Conn) {
+func newTestConn(t *testing.T) (conn *peer.Conn, messages <-chan peer.Message, server net.Conn) {
 	t.Helper()
 	client, server := net.Pipe()
 	conn = peer.NewConn(client, [20]byte{}, [8]byte{})
 	t.Cleanup(func() { conn.Close() })
-	return conn, server
+	msgs := make(chan peer.Message)
+	go readLoop(conn, msgs)
+	return conn, msgs, server
 }
 
 // runFullSeeder plays a well-behaved peer for an entire piece download:
@@ -175,13 +177,13 @@ func TestPieceHappyPath(t *testing.T) {
 	work := pieceWork(t, tor, 0)
 	expected := pieceData(t, tor, data, 0)
 
-	conn, server := newTestConn(t)
+	conn, messages, server := newTestConn(t)
 	go runFullSeeder(t, server, tor, work, expected, false)
 
-	if err := EnsureUnchoked(conn); err != nil {
+	if err := EnsureUnchoked(conn, messages); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	got, err := Piece(conn, work, tor.PieceCount(), nil)
+	got, err := Piece(conn, work, tor.PieceCount(), nil, messages, nil, nil)
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
 	}
@@ -203,13 +205,13 @@ func TestPieceCorruptedBlockFailsHash(t *testing.T) {
 	work := pieceWork(t, tor, 0)
 	expected := pieceData(t, tor, data, 0)
 
-	conn, server := newTestConn(t)
+	conn, messages, server := newTestConn(t)
 	go runFullSeeder(t, server, tor, work, expected, true)
 
-	if err := EnsureUnchoked(conn); err != nil {
+	if err := EnsureUnchoked(conn, messages); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	if _, err := Piece(conn, work, tor.PieceCount(), nil); err == nil {
+	if _, err := Piece(conn, work, tor.PieceCount(), nil, messages, nil, nil); err == nil {
 		t.Fatal("expected hash mismatch error, got nil")
 	}
 }
@@ -228,7 +230,7 @@ func TestPieceOutOfOrderBlocksAssembleCorrectly(t *testing.T) {
 	work := pieceWork(t, tor, 0)
 	expected := pieceData(t, tor, data, 0)
 
-	conn, server := newTestConn(t)
+	conn, messages, server := newTestConn(t)
 
 	// This seeder is scripted rather than a generic read/respond loop,
 	// because the whole point of the test is controlling the exact order
@@ -263,10 +265,10 @@ func TestPieceOutOfOrderBlocksAssembleCorrectly(t *testing.T) {
 		}
 	}()
 
-	if err := EnsureUnchoked(conn); err != nil {
+	if err := EnsureUnchoked(conn, messages); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	got, err := Piece(conn, work, tor.PieceCount(), nil)
+	got, err := Piece(conn, work, tor.PieceCount(), nil, messages, nil, nil)
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
 	}
@@ -298,7 +300,7 @@ func TestPieceChokeThenUnchokeResumes(t *testing.T) {
 	work := pieceWork(t, tor, 0)
 	expected := pieceData(t, tor, data, 0)
 
-	conn, server := newTestConn(t)
+	conn, messages, server := newTestConn(t)
 
 	go func() {
 		defer server.Close()
@@ -338,10 +340,10 @@ func TestPieceChokeThenUnchokeResumes(t *testing.T) {
 		send(t, server, peer.Message{ID: peer.MsgPiece, Payload: buildPiecePayload(work.Index, req2.Begin, block2)})
 	}()
 
-	if err := EnsureUnchoked(conn); err != nil {
+	if err := EnsureUnchoked(conn, messages); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	got, err := Piece(conn, work, tor.PieceCount(), nil)
+	got, err := Piece(conn, work, tor.PieceCount(), nil, messages, nil, nil)
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
 	}
@@ -367,7 +369,7 @@ func TestPieceGoesSilentTriggersReadTimeout(t *testing.T) {
 	work := pieceWork(t, tor, 0)
 	expected := pieceData(t, tor, data, 0)
 
-	conn, server := newTestConn(t)
+	conn, messages, server := newTestConn(t)
 
 	go func() {
 		defer server.Close()
@@ -402,10 +404,10 @@ func TestPieceGoesSilentTriggersReadTimeout(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}()
 
-	if err := EnsureUnchoked(conn); err != nil {
+	if err := EnsureUnchoked(conn, messages); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	if _, err := Piece(conn, work, tor.PieceCount(), nil); err == nil {
+	if _, err := Piece(conn, work, tor.PieceCount(), nil, messages, nil, nil); err == nil {
 		t.Fatal("expected a read-timeout error, got nil")
 	}
 }
@@ -422,7 +424,7 @@ func TestPieceNeverUnchokesTimesOut(t *testing.T) {
 	unchokeTimeout = 200 * time.Millisecond
 	defer func() { unchokeTimeout = oldUnchoke }()
 
-	conn, server := newTestConn(t)
+	conn, messages, server := newTestConn(t)
 
 	go func() {
 		defer server.Close()
@@ -430,7 +432,7 @@ func TestPieceNeverUnchokesTimesOut(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}()
 
-	if err := EnsureUnchoked(conn); err == nil {
+	if err := EnsureUnchoked(conn, messages); err == nil {
 		t.Fatal("expected an unchoke-timeout error, got nil")
 	}
 }
@@ -447,7 +449,7 @@ func TestPieceOutOfRangeIndexRejected(t *testing.T) {
 	tor, _ := loadFixture(t)
 	work := pieceWork(t, tor, 0)
 
-	conn, server := newTestConn(t)
+	conn, messages, server := newTestConn(t)
 
 	go func() {
 		defer server.Close()
@@ -471,10 +473,10 @@ func TestPieceOutOfRangeIndexRejected(t *testing.T) {
 		send(t, server, peer.Message{ID: peer.MsgPiece, Payload: badPayload})
 	}()
 
-	if err := EnsureUnchoked(conn); err != nil {
+	if err := EnsureUnchoked(conn, messages); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	if _, err := Piece(conn, work, tor.PieceCount(), nil); err == nil {
+	if _, err := Piece(conn, work, tor.PieceCount(), nil, messages, nil, nil); err == nil {
 		t.Fatal("expected error for out-of-range piece index, got nil")
 	}
 }
@@ -493,13 +495,13 @@ func TestPieceLastShortPiece(t *testing.T) {
 	work := pieceWork(t, tor, lastIndex)
 	expected := pieceData(t, tor, data, lastIndex)
 
-	conn, server := newTestConn(t)
+	conn, messages, server := newTestConn(t)
 	go runFullSeeder(t, server, tor, work, expected, false)
 
-	if err := EnsureUnchoked(conn); err != nil {
+	if err := EnsureUnchoked(conn, messages); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
-	got, err := Piece(conn, work, tor.PieceCount(), nil)
+	got, err := Piece(conn, work, tor.PieceCount(), nil, messages, nil, nil)
 	if err != nil {
 		t.Fatalf("Piece: %v", err)
 	}
@@ -529,7 +531,7 @@ func TestPieceMultipleDownloadsOnSameConnection(t *testing.T) {
 	expected1 := pieceData(t, tor, data, 1)
 	byIndex := map[int][]byte{0: expected0, 1: expected1}
 
-	conn, server := newTestConn(t)
+	conn, messages, server := newTestConn(t)
 
 	// Same reader/writer split as runFullSeeder, for the same reason: two
 	// pieces means up to four pipelined block requests can arrive before
@@ -573,11 +575,11 @@ func TestPieceMultipleDownloadsOnSameConnection(t *testing.T) {
 		}
 	}()
 
-	if err := EnsureUnchoked(conn); err != nil {
+	if err := EnsureUnchoked(conn, messages); err != nil {
 		t.Fatalf("EnsureUnchoked: %v", err)
 	}
 
-	got0, err := Piece(conn, work0, tor.PieceCount(), nil)
+	got0, err := Piece(conn, work0, tor.PieceCount(), nil, messages, nil, nil)
 	if err != nil {
 		t.Fatalf("Piece(0): %v", err)
 	}
@@ -586,7 +588,7 @@ func TestPieceMultipleDownloadsOnSameConnection(t *testing.T) {
 	}
 
 	// No second EnsureUnchoked call - the whole point of this test.
-	got1, err := Piece(conn, work1, tor.PieceCount(), nil)
+	got1, err := Piece(conn, work1, tor.PieceCount(), nil, messages, nil, nil)
 	if err != nil {
 		t.Fatalf("Piece(1): %v", err)
 	}

@@ -10,7 +10,6 @@ import (
 
 	"github.com/asmanya/p2p-file-distribution/internal/metainfo"
 	"github.com/asmanya/p2p-file-distribution/internal/peer"
-	"github.com/asmanya/p2p-file-distribution/internal/piece"
 	"github.com/asmanya/p2p-file-distribution/internal/storage"
 	"github.com/asmanya/p2p-file-distribution/internal/tracker"
 )
@@ -78,31 +77,23 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	have := NewHaveBitfield(pieceCount)
 	completed := 0
 
-	// creating the queue - already-verified pieces are never added, so there's nothing to "skip" at request time
-	work := make([]piece.Work, 0, pieceCount)
+	resultCh := make(chan Result, resultsBufferSize)
+	coordinator := NewCoordinator(pieceCount, tor.PieceLength, tor.TotalLength, tor.PiecesHashes, resultCh, progress)
+
+	// already-verified pieces are marked complete before Run starts - nothing to "skip" at request time, the
+	// coordinator simply never offers them to anyone
 	for i := 0; i < pieceCount; i++ {
 		if verifiedPieces[i] {
+			coordinator.MarkComplete(i)
 			have.Set(i)
 			completed++
 			progress.PieceCompleted() // so Percent()/ETA() reflect resumed progress from the start, not just this session's
-			continue
 		}
-		length, err := piece.Length(i, pieceCount, tor.PieceLength, tor.TotalLength)
-		if err != nil {
-			return err
-		}
-		work = append(work, piece.Work{
-			Index:        i,
-			ExpectedHash: tor.PiecesHashes[i][:],
-			Length:       length,
-		})
 	}
 
 	if completed > 0 {
 		slog.Info("resume: found existing verified data", "pieces_already_done", completed, "pieces_remaining", pieceCount-completed)
 	}
-
-	workCh, resultCh := NewQueues(work)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -110,6 +101,12 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 
 	// calling workers
 	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		coordinator.Run(ctx)
+	}()
+
 	var mu sync.Mutex // guards connected - touched by both announce() and the stall check
 	connected := make(map[netip.AddrPort]bool)
 	minReannounceInterval := stallTimeout
@@ -138,7 +135,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			wg.Add(1)
 			go func(addr netip.AddrPort) {
 				defer wg.Done()
-				worker(ctx, addr, tor.InfoHash, peerID, pieceCount, workCh, resultCh, progress)
+				worker(ctx, addr, tor.InfoHash, peerID, pieceCount, coordinator, progress)
 			}(addr)
 		}
 		return nil
@@ -170,6 +167,19 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 				"eta", progress.ETA(tor.TotalLength).Round(time.Second),
 			)
 
+			// Checked here, on the same 1-second ticker, rather than a separate time.After(stallTimeout) case: a
+			// fresh time.After call re-armed on every trip around this select would never survive the 30 seconds it
+			// needs to fire, because this ticker case wins the select every second and restarts the loop first. A
+			// goroutine per connected peer stuck requesting a piece nobody in the swarm has, or every worker having
+			// died and left nothing behind, is fixed the same way: more peers. Respect the tracker's own minimum
+			// interval so a stall doesn't turn into a rate-limit ban.
+			stalled := time.Since(lastProgress) >= stallTimeout
+			allowedToReannounce := time.Since(lastAnnounce) >= minReannounceInterval
+			if stalled && allowedToReannounce {
+				_ = announce() // best-effort - a failed re-announce just means we try again at the next tick
+				lastAnnounce = time.Now()
+			}
+
 		case result := <-resultCh:
 			if err := sf.WritePiece(result.Index, pieceCount, tor.PieceLength, tor.TotalLength, result.Data); err != nil {
 				return fmt.Errorf("download: write piece %d: %w", result.Index, err)
@@ -178,23 +188,11 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			completed++
 			progress.PieceCompleted()
 			lastProgress = time.Now()
-
-		case <-time.After(stallTimeout):
-			// A goroutine per connected peer is stuck requesting a piece nobody in the swarm has, or every worker
-			// has died and left the queue untouched - either way, more peers are the fix. Respect the tracker's own
-			// minimum interval so a stall doesn't turn into a rate-limit ban.
-			stalled := time.Since(lastProgress) >= stallTimeout
-			allowedToReannounce := time.Since(lastAnnounce) >= minReannounceInterval
-			if stalled && allowedToReannounce {
-				_ = announce() // best-effort - a failed re-announce just means we try again at the next stall check
-				lastAnnounce = time.Now()
-			}
 		}
 	}
 
-	close(workCh) // no more work - remaining idle workers see this and exit
-	cancel()      // belt-and-braces: unblocks anything still mid-operation
-	wg.Wait()     // don't return until worker has actually cleaned up
+	cancel()  // belt-and-braces: unblocks anything still mid-operation
+	wg.Wait() // don't return until worker has actually cleaned up
 
 	if err := sf.Sync(); err != nil {
 		return fmt.Errorf("download: sync output file: %w", err)
@@ -215,6 +213,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 		"connect_success_rate", fmt.Sprintf("%.0f%% (%d/%d)", successRate, successes, attempts),
 		"hash_failures", progress.HashFailures(),
 		"panics_recovered", progress.Panics(),
+		"duplicate_assignments", progress.DuplicateAssignments(),
 	)
 
 	return nil

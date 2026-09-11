@@ -27,10 +27,10 @@ flag parsing and a single call into `internal/download`.
 
 | State | Owner | Notes |
 |-------|-------|-------|
-| `workCh` (piece work items) | No owner — the channel is the synchronization | Buffered to exactly the piece count, so a push can never block |
-| `resultCh` (verified results) | No owner, but every send races `ctx.Done()` in a `select` | The buffer is small and fixed, not sized to piece count, so an unconditional send could hang forever with no reader during shutdown |
-| `Progress.bytesDownloaded`, `.activePeers`, `.peakPeers`, `.connectAttempts/Successes`, `.hashFailures`, `.panics` | Any worker goroutine | Plain `sync/atomic` counters, no mutex |
-| `Progress.piecesDone`, `.samples` (rate window) | `Download`'s main goroutine only | No worker ever touches these |
+| `Coordinator.pieces`, `.availability`, `.peers`, `.assignments`, `.endgame` | `Coordinator.Run`'s single goroutine, reached only through its `events` channel | No mutex anywhere in the coordinator — nothing outside that one goroutine ever touches this state |
+| `resultCh` (verified results) | No owner, but every send from the coordinator races `ctx.Done()` in a `select` | The buffer is small and fixed, not sized to piece count, so an unconditional send could hang forever with no reader during shutdown |
+| `Progress.bytesDownloaded`, `.activePeers`, `.peakPeers`, `.connectAttempts/Successes`, `.hashFailures`, `.panics`, `.duplicateAssignments` | Any worker goroutine, or the coordinator's own goroutine | Plain `sync/atomic` counters, no mutex |
+| `Progress.piecesDone`, `.samples` (rate window) | `Download`'s main goroutine only | Neither a worker nor the coordinator ever touches these |
 | `connected` (dialed peer addresses, inside `Download`) | `Download`'s main goroutine, through the `announce` closure | The mutex is defensive rather than load-bearing — `announce` is only ever called from the main goroutine |
 | `HaveBitfield.bf` (pieces already verified or on disk) | Mutex-guarded | Only the main goroutine writes today, as pieces complete; seeding will add concurrent readers later, so the mutex is already in place |
 | `storage.File` writes (`WriteAt` per piece) | No owner needed | Each piece owns a disjoint byte range, and positional writes to non-overlapping ranges don't need a lock |
@@ -330,67 +330,131 @@ explicitly, since it's the first thing a reviewer will flag.
 
 ### internal/download
 
-The only package with full system visibility. It owns the work queue,
+The only package with full system visibility. It owns the coordinator,
 every peer worker goroutine, and assembly of verified pieces into the
 final file. Everything below it is mechanism; this is where policy
 lives.
 
-A single-piece download — interested, unchoke, pipelined block requests,
-assemble, verify — is one function, reused unchanged by every concurrent
-worker. Concurrency was added around this function, not inside it. Up
-to five block requests get pipelined per piece, so round-trip latency
-overlaps across blocks instead of serializing one request at a time
-behind it; the number is a fixed starting point, flagged for later
-tuning. A choking peer resets in-flight request bookkeeping immediately,
-since a choke silently drops every request already sent, and anything
-still counted as in-flight has to be treated as lost right away or the
-download stalls waiting on answers that will never come. A piece
-download carries three timeouts, not one: an overall cap, plus a
-shorter idle-read deadline that resets on every block actually received,
-so a slow-but-progressing peer survives and only a genuinely stalled one
-gets dropped.
+A single-piece download (interested, unchoke, pipelined block
+requests, assemble, verify) is one function, reused unchanged by every
+concurrent worker. Up to five block requests get pipelined per piece,
+so round-trip latency overlaps across blocks instead of serializing
+one request at a time behind it; the number is a fixed starting
+point, flagged for later tuning. A choking peer resets in-flight
+request bookkeeping immediately, since a choke silently drops every
+request already sent, and anything still counted as in-flight has to
+be treated as lost right away or the download stalls waiting on
+answers that will never come. A piece download carries three
+timeouts, not one: an overall cap, plus a shorter idle-read deadline
+that resets on every block actually received, so a slow-but-progressing
+peer survives and only a genuinely stalled one gets dropped.
 
-Concurrency itself is a plain work queue (Design A), not a coordinator.
-One channel is pre-filled with every piece up front, buffered to exactly
-the piece count so a worst-case requeue storm can't deadlock. One
-goroutine runs per peer; a failed or corrupt piece goes back onto the
-queue for another peer to try, so recovery comes from the architecture
-rather than explicit retry logic. Every worker send that isn't provably
-safe races `ctx.Done()` in a `select` — `workCh`'s buffer is sized to
-make its sends safe by construction, but `resultCh`'s isn't, so its send
-has to be cancellable or a worker finishing at the wrong moment during
-shutdown can hang `Download` forever. A worker's panic is recovered,
-loudly (full stack trace at error level, plus a running count), so one
-bad peer can't take down every other in-progress connection and the
-failure still doesn't go unnoticed during development.
+Concurrency started as a plain work queue. One channel was pre-filled
+with every piece, buffered to exactly the piece count so a worst-case
+requeue storm couldn't deadlock, with one goroutine per peer pulling
+from it. That design has an inherent ceiling, though. No single
+component ever sees more than its own connection, so rarest-first
+selection, duplicate prevention, and an endgame mode are all
+structurally impossible on top of it. Concurrency now runs through a
+coordinator instead: one goroutine owning every piece's status, its
+availability across the swarm, the peer registry, and every in-flight
+assignment, reached only through an `events` channel workers send to
+and a per-peer `commands` channel it sends back on. No mutex guards
+any of it, because no other goroutine ever touches that state. It's
+the same *share memory by communicating* principle the rest of this
+codebase already leans on, applied to the one place with genuinely
+complex shared state.
 
-Progress counters are atomic wherever multiple workers touch them —
-bytes, active and peak peers, connect stats, hash failures, panics — and
-otherwise owned by `Download`'s main goroutine alone (pieces done, the
-rate window), the same ownership-over-locking principle applied
-throughout this codebase. Progress is printed from exactly one place, a
-ticker inside `Download`'s own select loop; workers never print
-directly, since a hundred goroutines writing to stdout independently
-would produce unreadable, interleaved output.
+Rarest-first selection exists for swarm health, not speed. Replicating
+the pieces only one or two peers hold is what stops a torrent from
+permanently losing data the moment its last holder disconnects. A
+throughput improvement, if there is one, is a side effect, not the
+goal. Duplicate requests are prevented by piece state alone
+(missing/in-flight/complete) rather than a separate tracking
+structure, and every assignment carries a timeout: a half-open TCP
+connection, one where the peer is gone but the OS hasn't noticed,
+would otherwise hold a piece hostage forever with no error and no
+visible symptom beyond a stalled download. Near the end of a
+download, duplicate prevention turns off on purpose. The last few
+incomplete pieces get requested from every idle peer that has them,
+and the first one to finish cancels the rest. Sending that
+cancellation is not optional; a peer left sending blocks nobody needs
+any more wastes the swarm's bandwidth, not just this client's.
 
-Resume is a filter on the work queue rather than a separate code path.
-`Download` calls `storage.VerifyExisting` once at startup; anything
-already verified gets marked in the `have` bitfield and simply never
-added to `work` in the first place. There's no "skip this piece" branch
-anywhere downstream — a piece that's already done was never a candidate
-for downloading to begin with. Resumed pieces still have to be reported
-to `Progress` explicitly, though: the loop counter (`completed`) starts
-at the resumed count correctly, but `Progress.piecesDone` is a separate
-field that only advances when `PieceCompleted` is called. Missing that
-call for resumed pieces was a real bug caught during manual testing —
-the loop itself worked fine, but `Percent()` and `ETA()` still read 0%
-at the start of a resumed run, because two counters that need to move
-together are an easy thing to under-update. The final throughput figure
-divides by bytes actually transferred this session
-(`Progress.BytesDownloaded()`) rather than the torrent's total size, for
-a related reason: a resumed download's elapsed time only covers the
-pieces it actually fetched, so dividing the whole file's size by that
-time would overstate throughput by however much resume skipped.
+Because piece-selection policy and connection mechanics are now fully
+separate, the coordinator is tested as a pure state machine: events
+in, commands out, no network, no timing, milliseconds per test. That
+separation is worth more than it looks. The alternative, policy
+tangled into the same code as socket I/O, would need fake peers and
+real timeouts to test the same logic, which is the same trade-off
+`bencode` and `metainfo` made by keeping parsing pure and I/O thin.
+
+The worker rewrite this required turned each peer connection from one
+goroutine into two. A worker can no longer just block on
+`conn.ReadMessage()`, because it now also has to watch its `commands`
+channel for whatever the coordinator sends. A small dedicated
+`readLoop` goroutine does nothing but turn blocking reads into
+channel sends, letting the worker's own `select` watch both sources
+at once. The goroutine-leak test had to be re-run deliberately here:
+doubling the goroutines per peer doubles the ways one of them could
+fail to exit, and a leak that only shows up per connection is easy to
+miss until it's multiplied by a swarm's worth of peers.
+
+Two real bugs surfaced only once this ran against a live swarm rather
+than fixtures. First, the stall-detection `select` re-created its
+`time.After(stallTimeout)` timer on every trip through the loop, and
+since a separate 1-second progress ticker fired first every time, that
+30-second timer could never actually survive long enough to fire.
+Reannounce-on-stall had silently never worked, on either design.
+Second, `Progress.Rate()` only pruned its sample window when a new
+sample arrived, so during a genuine stall it kept reporting whatever
+it had last computed instead of admitting nothing recent had
+happened. Both were fixed by moving the stall check onto the same
+ticker that was already firing every second, and by having `Rate()`
+return zero once its newest sample is older than its own window.
+
+A further pair of bugs was specific to the coordinator refactor
+itself, and both concerned endgame. Assigning a piece to an idle peer
+initially picked the *first* incomplete piece that peer had, so every
+idle peer converged on the same one piece while the rest of the
+endgame set sat completely untouched, serializing exactly the phase
+endgame exists to parallelize. And the trigger condition counted only
+strictly-unassigned pieces, not ones already in flight, so endgame
+could fire while far more than its threshold of pieces were actually
+still outstanding, needlessly widening its own blast radius of
+duplicate requests. Fixing both dropped measured duplicate piece
+requests by roughly three quarters, same code, same day, nothing else
+changed. See the README's performance comparison.
+
+Progress counters are atomic wherever more than one goroutine touches
+them: bytes, active and peak peers, connect stats, hash failures,
+panics, duplicate assignments. Everything else is owned by
+`Download`'s main goroutine alone (pieces done, the rate window), the
+same ownership-over-locking principle applied throughout this
+codebase. Progress is printed from exactly one place, a ticker inside
+`Download`'s own select loop; workers never print directly, since a
+hundred goroutines writing to stdout independently would produce
+unreadable, interleaved output.
+
+Resume marks pieces complete on the coordinator directly, before
+`Run` starts, rather than filtering a work queue. `Download` calls
+`storage.VerifyExisting` once at startup; anything already verified
+gets marked in the `have` bitfield and handed to the coordinator's
+`MarkComplete`, so it's simply never offered to any peer. There's no
+"skip this piece" branch anywhere downstream. Resumed pieces still
+have to be reported to `Progress` explicitly, though: the loop
+counter (`completed`) starts at the resumed count correctly, but
+`Progress.piecesDone` is a separate field that only advances when
+`PieceCompleted` is called. Missing that call for resumed pieces was
+a real bug caught during manual testing. The loop itself worked
+fine, but `Percent()` and `ETA()` still read 0% at the start of a
+resumed run, because two counters that need to move together are an
+easy thing to under-update. The final throughput figure divides by
+bytes actually transferred this session (`Progress.BytesDownloaded()`)
+rather than the torrent's total size, for a related reason: a resumed
+download's elapsed time only covers the pieces it actually fetched,
+so dividing the whole file's size by that time would overstate
+throughput by however much resume skipped.
 
 ### internal/storage
 

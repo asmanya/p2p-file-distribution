@@ -14,46 +14,60 @@ import (
 
 const bitfieldWaitTimeout = 10 * time.Second
 
-// requestBackoff is a small pause before a worker goes back to the queue after finding out the peer it's connected to
-// doesn't have the piece it just grabbed. Without it, a peer missing a piece the rest of the swarm also lacks turns
-// into a tight requeue/grab/requeue loop across every worker holding that connection - all CPU, no progress.
-const requeueBackoff = 50 * time.Millisecond
+// readLoop is a worker's dedicated connection reader: its only job is turning blocking conn.ReadMessage() calls
+// into channel sends, so worker's main select loop can watch both the coordinator's commands and incoming wire
+// messages at once, instead of being stuck inside a direct blocking read. It closes messages when the connection
+// dies - a read error, or a peer that's gone silent past readTimeout.
+func readLoop(conn *peer.Conn, messages chan<- peer.Message) {
+	defer close(messages)
+	for {
+		if err := conn.SetIODeadline(readTimeout); err != nil {
+			return
+		}
+		msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		messages <- msg
+	}
+}
 
-// worker connects to one peer and downloads pieces from workCh until the queue is drained, the context is cancelled,
-// or the connection fails. Every piece it can't complete goes back onto workCh before it exits, so another
-// worker can pick it up from a healthier peer.
+// worker connects to one peer and drives it entirely through events sent to, and commands received from, the
+// coordinator - it never decides which piece to download next, only executes what it's told and reports what
+// happens.
 //
-// A panic anywhere in this function is recovered, not left to crash the whole program - a single malicious or buggy
-// peer shouldn't be able to take down every other in-progress connection with it. The recovery is loud (full stack
-// trace at error level) precisely so it never quietly hides a real bug during development.
-func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte, pieceCount int, workCh chan piece.Work, resultCh chan Result, progress *Progress) {
-	var current *piece.Work
+// A panic anywhere in this function is recovered, not left to crash the whole program - a single malicious or
+// buggy peer shouldn't be able to take down every other in-progress connection with it.
+func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte, pieceCount int, coordinator *Coordinator, progress *Progress) {
 	defer func() {
 		if r := recover(); r != nil {
 			progress.PanicRecovered()
 			slog.Error("worker: recovered from panic", "peer", addr, "panic", r, "stack", string(debug.Stack()))
-			if current != nil {
-				workCh <- *current
-			}
 		}
 	}()
+
+	events := coordinator.Events()
+	sendEvent := func(ev Event) bool {
+		select {
+		case events <- ev:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 
 	progress.ConnectAttempted()
 	conn, err := peer.Dial(addr.String(), infoHash, peerID)
 	if err != nil {
-		return // dead-peer - expected, nothing to log loudly about here
+		return // dead peer - expected, nothing to log loudly about here
 	}
 	progress.ConnectSucceeded()
 	defer conn.Close()
 	progress.PeerConnected()
 	defer progress.PeerDisconnected()
 
-	// Piece(), EnsureUnchoked(), and friends only know about read/write
-	// deadlines measured in seconds - they have no idea ctx exists. Rather
-	// than threading ctx through every one of them, this goroutine watches
-	// for cancellation and forces the connection closed the moment it
-	// happens, which makes any Read or Write currently blocked on it return
-	// immediately with an error instead of waiting out its own timeout.
+	// Force any blocked read to return immediately on cancellation - readLoop has no idea ctx exists, it only
+	// blocks on conn.ReadMessage().
 	watchDone := make(chan struct{})
 	defer close(watchDone)
 	go func() {
@@ -64,58 +78,94 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 		}
 	}()
 
-	if err := receiveBitfield(conn, pieceCount); err != nil {
+	commands := make(chan Command, 1)
+	if !sendEvent(PeerJoined{Addr: addr, Commands: commands}) {
+		return
+	}
+	defer sendEvent(PeerLeft{Addr: addr})
+
+	messages := make(chan peer.Message)
+	go readLoop(conn, messages)
+
+	bf, err := receiveBitfield(messages, pieceCount)
+	if err != nil {
+		return
+	}
+	if bf != nil {
+		conn.PeerBitfield = bf
+		if !sendEvent(BitfieldReceived{Addr: addr, Bitfield: bf}) {
+			return
+		}
+	}
+
+	if err := EnsureUnchoked(conn, messages); err != nil {
 		return
 	}
 
-	if err := EnsureUnchoked(conn); err != nil {
+	if !sendEvent(PeerReady{Addr: addr}) {
 		return
 	}
+
+	onHave := func(index int) { sendEvent(HaveReceived{Addr: addr, Index: index}) }
 
 	for {
-		// ctx.Done() sits in the same select as the channel read, not in a
-		// separate check beforehand - a lone "check, then maybe block on
-		// workCh" would miss a cancellation that arrives while this worker
-		// is sitting idle waiting for a piece that never comes.
-		var work piece.Work
-		var ok bool
 		select {
 		case <-ctx.Done():
 			return
-		case work, ok = <-workCh:
+
+		case cmd, ok := <-commands:
 			if !ok {
-				return // queue closed - download is complete or shutting down
+				return
 			}
-		}
-		current = &work
+			switch c := cmd.(type) {
+			case AssignPiece:
+				work := piece.Work{Index: c.Index, ExpectedHash: c.ExpectedHash, Length: c.Length}
+				data, err := Piece(conn, work, pieceCount, progress, messages, commands, onHave)
+				switch {
+				case err == errCancelled:
+					// abandoned mid-flight - the coordinator already knows someone else finished this piece
+				case err == errShutdown:
+					return
+				case err != nil:
+					sendEvent(PieceFailed{Addr: addr, Index: c.Index, Reason: err})
+					return // this connection is suspect - let another worker take over
+				default:
+					_ = conn.SendHave(c.Index) // best-effort courtesy
+					if !sendEvent(PieceDownloaded{Addr: addr, Index: c.Index, Data: data}) {
+						return
+					}
+				}
+				if !sendEvent(PeerReady{Addr: addr}) {
+					return
+				}
 
-		if conn.PeerBitfield != nil && !conn.PeerBitfield.HasPiece(work.Index) {
-			workCh <- work
-			current = nil
-			time.Sleep(requeueBackoff)
-			continue
-		}
+			case CancelPiece:
+				// nothing in flight right now - a cancel that arrived after we'd already finished or given up
 
-		data, err := Piece(conn, work, pieceCount, progress)
-		if err != nil {
-			workCh <- work
-			return // this connection is suspect - let another worker take over
-		}
-		current = nil // downloaded and verified - no longer at risk of being lost to a panic
+			case Pause:
+				// nothing to do, just keep waiting for the next command
 
-		// best-effort courtesy notice - failing to send it doesn't
-		// invalidate the piece we already downloaded and verified
-		_ = conn.SendHave(work.Index)
+			case Shutdown:
+				return
+			}
 
-		// A plain, unconditional send here would risk hanging forever: resultCh's buffer (queue.go) is a small fixed
-		// size, not one slot per piece like workCh's is, so it offers no such guarantee. If Download() has already
-		// taken its ctx.Done() shutdown path, nothing is left to drain this channel - without the ctx.Done() case
-		// below, a worker finishing at exactly the wrong moment would block here forever, and wg.Wait() in Download()
-		// would never return.
-		select {
-		case resultCh <- Result{Index: work.Index, Data: data}:
-		case <-ctx.Done():
-			return
+		case msg, ok := <-messages:
+			if !ok {
+				return // reader goroutine's connection died
+			}
+			switch msg.ID {
+			case peer.MsgHave:
+				if h, err := peer.ParseHavePayload(msg.Payload, pieceCount); err == nil {
+					conn.PeerBitfield.SetPiece(h.Index)
+					if !sendEvent(HaveReceived{Addr: addr, Index: h.Index}) {
+						return
+					}
+				}
+			case peer.MsgChoke:
+				conn.PeerChoking = true
+			case peer.MsgUnchoke:
+				conn.PeerChoking = false
+			}
 		}
 	}
 }
@@ -123,21 +173,17 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 // receiveBitfield waits briefly for the peer's bitfield, which - if sent at all - is conventionally the first message
 // after a handshake. A peer with zero pieces may skip it entirely, so a timeout or an early non-bitfield message
 // here is treated as "no pieces yet", not a fatal error.
-func receiveBitfield(conn *peer.Conn, pieceCount int) error {
-	if err := conn.SetIODeadline(bitfieldWaitTimeout); err != nil {
-		return err
+func receiveBitfield(messages <-chan peer.Message, pieceCount int) (peer.Bitfield, error) {
+	select {
+	case msg, ok := <-messages:
+		if !ok || msg.ID != peer.MsgBitfield {
+			return nil, nil
+		}
+		if err := peer.Validate(peer.Bitfield(msg.Payload), pieceCount); err != nil {
+			return nil, fmt.Errorf("download: %w", err)
+		}
+		return peer.Bitfield(msg.Payload), nil
+	case <-time.After(bitfieldWaitTimeout):
+		return nil, nil
 	}
-	msg, err := conn.ReadMessage()
-	if err != nil {
-		return nil
-	}
-	if msg.ID != peer.MsgBitfield {
-		return nil
-	}
-	if err := peer.Validate(peer.Bitfield(msg.Payload), pieceCount); err != nil {
-		return fmt.Errorf("download: %w", err)
-	}
-
-	conn.PeerBitfield = peer.Bitfield(msg.Payload)
-	return nil
 }
