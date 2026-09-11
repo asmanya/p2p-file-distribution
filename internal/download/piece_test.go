@@ -92,13 +92,26 @@ func send(t *testing.T, conn net.Conn, msg peer.Message) {
 // the same way a real Dial would after a completed handshake. The returned
 // server end is handed to a fake-seeder goroutine that plays the role of
 // the remote peer for the rest of the test.
+//
+// Cleanup waits for readLoop to actually exit, not just for conn.Close() to return - readLoop reads the
+// package-level readTimeout var on its own schedule, outside the test's own goroutine, and some tests (e.g.
+// TestPieceGoesSilentTriggersReadTimeout) mutate that var. Without waiting, a previous test's readLoop can still be
+// reading it the moment the next test writes to it - a real data race caught by CI, not something to be lucky
+// about locally.
 func newTestConn(t *testing.T) (conn *peer.Conn, messages <-chan peer.Message, server net.Conn) {
 	t.Helper()
 	client, server := net.Pipe()
 	conn = peer.NewConn(client, [20]byte{}, [8]byte{})
-	t.Cleanup(func() { conn.Close() })
 	msgs := make(chan peer.Message)
-	go readLoop(conn, msgs)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		readLoop(conn, msgs)
+	}()
+	t.Cleanup(func() {
+		conn.Close()
+		<-done
+	})
 	return conn, msgs, server
 }
 
