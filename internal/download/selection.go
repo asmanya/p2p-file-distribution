@@ -10,15 +10,16 @@ import (
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
 )
 
-// assignmentTimeout is how long a piece stays in-flight before the coordinator gives up on the peer it assigned to and
-// frees the piece for someone else. Without this, a half-open TCP connection - one where the peer is gone but OS hasn't
-// noticed yet - would hold a piece hostage forever, and the download would stall at 99& with no error and no log to explain why.
+// assignmentTimeout is how long a single assignee stays in flight before the coordinator gives up on it and frees
+// that assignee's slot for someone else. Without this, a half-open TCP connection - one where the peer is gone but
+// the OS hasn't noticed yet - would hold a piece hostage forever, and the download would stall at 99% with no
+// error and no log to explain why.
 const assignmentTimeout = 30 * time.Second
 
 // selectPieceFor picks the best piece to assign a peer with the given bitfield: among pieces that are (a) missing,
 // (b) not already in flight, and (c) present in have, it picks the one with the lowest availability - the piece closest
 // to disappearing from the swarm entirely if its last holder leaves. Ties are broken randomly (reservoir sampling of one)
-// so peers don't all converge on  the same single rarest piece and serialize the download.
+// so peers don't all converge on the same single rarest piece and serialize the download.
 //
 // Returns false if the peer has nothing useful to offer right now.
 func (c *Coordinator) selectPieceFor(have peer.Bitfield) (int, bool) {
@@ -62,10 +63,7 @@ func (c *Coordinator) sendAssignCommand(addr netip.AddrPort, p *peerInfo, index 
 	}
 
 	c.pieces[index] = pieceInFlight
-	c.assignments[index] = append(c.assignments[index], addr)
-	if _, ok := c.assignedAt[index]; !ok {
-		c.assignedAt[index] = time.Now()
-	}
+	c.assignments[index] = append(c.assignments[index], assignment{addr: addr, at: time.Now()})
 
 	slog.Debug("coordinator: assigned piece",
 		"index", index,
@@ -76,8 +74,8 @@ func (c *Coordinator) sendAssignCommand(addr netip.AddrPort, p *peerInfo, index 
 	return true
 }
 
-// assignpiece is the normal (non-endgame) path: exactly one assignment per piece.
-func (c *Coordinator) AssignPiece(addr netip.AddrPort, p *peerInfo, index int) bool {
+// assignPiece is the normal (non-endgame) path: exactly one assignment per piece.
+func (c *Coordinator) assignPiece(addr netip.AddrPort, p *peerInfo, index int) bool {
 	if !c.sendAssignCommand(addr, p, index) {
 		return false
 	}
@@ -85,21 +83,31 @@ func (c *Coordinator) AssignPiece(addr netip.AddrPort, p *peerInfo, index int) b
 	return true
 }
 
-// freeStaleAssignments releases any piece that's been in flight longer than assignmentTimeout, marking it missing again
-// so the next ready peer can pick it up. Called from Coordinator's periodic tick, not from any single event.
+// freeStaleAssignments releases any individual assignee that's been in flight longer than assignmentTimeout - not
+// the whole piece at once. During endgame a piece can have several assignees who started at different times, so a
+// slow first assignee timing out must not take down a healthy later one; a piece only goes back to missing once
+// every one of its assignees has timed out.
 func (c *Coordinator) freeStaleAssignments() {
 	now := time.Now()
-	for index, assignedAt := range c.assignedAt {
-		if now.Sub(assignedAt) < assignmentTimeout {
-			continue
-		}
-		for _, addr := range c.assignments[index] {
-			if p, ok := c.peers[addr]; ok && p.assigned == index {
+	for index, assignees := range c.assignments {
+		kept := assignees[:0:0]
+		for _, a := range assignees {
+			if now.Sub(a.at) < assignmentTimeout {
+				kept = append(kept, a)
+				continue
+			}
+			if p, ok := c.peers[a.addr]; ok && p.assigned == index {
 				p.assigned = -1
 			}
 		}
-		c.pieces[index] = pieceMissing
-		delete(c.assignments, index)
-		delete(c.assignedAt, index)
+		if len(kept) == len(assignees) {
+			continue // nothing timed out for this piece
+		}
+		if len(kept) == 0 {
+			c.pieces[index] = pieceMissing
+			delete(c.assignments, index)
+		} else {
+			c.assignments[index] = kept
+		}
 	}
 }

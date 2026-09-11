@@ -161,7 +161,7 @@ func TestCoordinatorAssignmentTimeoutFreesStalePiece(t *testing.T) {
 	joinPeer(c, addr, bitfieldOf(1, 0))
 	c.handlePeerReady(PeerReady{Addr: addr})
 
-	c.assignedAt[0] = time.Now().Add(-assignmentTimeout - time.Second)
+	c.assignments[0][0].at = time.Now().Add(-assignmentTimeout - time.Second)
 	c.freeStaleAssignments()
 
 	if c.pieces[0] != pieceMissing {
@@ -198,6 +198,46 @@ func TestCoordinatorEndgameTriggersAtThreshold(t *testing.T) {
 	case <-commands:
 	default:
 		t.Fatal("expected the idle peer to be assigned a piece once endgame triggered")
+	}
+}
+
+// --- Scenario 7b: endgame spreads idle peers across pieces, not one at a time ---
+//
+// Three idle peers, all holding all three remaining pieces. Without picking the least-covered piece, every peer
+// would land on the same first incomplete index, leaving the other two pieces with zero coverage until that one
+// finishes - serializing the exact phase endgame exists to parallelize.
+func TestCoordinatorEndgameSpreadsIdlePeersAcrossPieces(t *testing.T) {
+	c, _ := newTestCoordinator(3)
+	c.endgame = true
+
+	full := bitfieldOf(3, 0, 1, 2)
+	addrs := []netip.AddrPort{
+		netip.MustParseAddrPort("127.0.0.1:1"),
+		netip.MustParseAddrPort("127.0.0.1:2"),
+		netip.MustParseAddrPort("127.0.0.1:3"),
+	}
+	commandsByAddr := make(map[netip.AddrPort]chan Command)
+	for _, a := range addrs {
+		commandsByAddr[a] = joinPeer(c, a, full)
+	}
+
+	assigned := make(map[int]bool)
+	for _, a := range addrs {
+		c.handlePeerReady(PeerReady{Addr: a})
+		select {
+		case cmd := <-commandsByAddr[a]:
+			ap, ok := cmd.(AssignPiece)
+			if !ok {
+				t.Fatalf("expected AssignPiece, got %T", cmd)
+			}
+			assigned[ap.Index] = true
+		default:
+			t.Fatalf("peer %v got no assignment", a)
+		}
+	}
+
+	if len(assigned) != 3 {
+		t.Errorf("3 idle peers with identical bitfields covering 3 missing pieces should spread across all 3, got coverage of %d: %v", len(assigned), assigned)
 	}
 }
 

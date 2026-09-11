@@ -28,9 +28,17 @@ type peerInfo struct {
 	assigned int // piece index this peer is currently downloading, -1 if idle
 }
 
+// assignment records one peer currently downloading one piece, and when that assignment was made. Timestamps are
+// per-assignee, not per-piece: during endgame a piece can have several assignees who started at different times,
+// and a slow first assignee timing out must not take down a healthy later one.
+type assignment struct {
+	addr netip.AddrPort
+	at   time.Time
+}
+
 // Coordinator owns every piece of state a Design B download needs: which pieces are done, how rare each one is, which peers
-// are connected, dnd what's currently in flight. All of it lives inside Run's goroutine and is reached only through events
-// - nothing here is guarded by a mutex, becuase no other goroutine ever touches it.
+// are connected, and what's currently in flight. All of it lives inside Run's goroutine and is reached only through events
+// - nothing here is guarded by a mutex, because no other goroutine ever touches it.
 type Coordinator struct {
 	pieceCount               int
 	pieceLength, totalLength int64
@@ -39,8 +47,7 @@ type Coordinator struct {
 	pieces       []pieceState
 	availability []int
 	peers        map[netip.AddrPort]*peerInfo
-	assignments  map[int][]netip.AddrPort // piece index -> holder, in flight pieces only
-	assignedAt   map[int]time.Time        // piece index -> when it was assigned, for timeout detection
+	assignments  map[int][]assignment // piece index -> current assignees (usually 1, more only during endgame)
 	endgame      bool
 
 	events  chan Event
@@ -60,15 +67,14 @@ func NewCoordinator(pieceCount int, pieceLength, totalLength int64, pieceHashes 
 		pieces:       make([]pieceState, pieceCount),
 		availability: make([]int, pieceCount),
 		peers:        make(map[netip.AddrPort]*peerInfo),
-		assignments:  make(map[int][]netip.AddrPort),
+		assignments:  make(map[int][]assignment),
 		events:       make(chan Event),
 		results:      results,
-		assignedAt:   make(map[int]time.Time),
 		progress:     progress,
 	}
 }
 
-// Events return the channel workers report events on. Send-only, so callers can't accidently read from it.
+// Events return the channel workers report events on. Send-only, so callers can't accidentally read from it.
 func (c *Coordinator) Events() chan<- Event {
 	return c.events
 }
@@ -133,7 +139,7 @@ func (c *Coordinator) handleHaveReceived(e HaveReceived) {
 		return
 	}
 	if p.have.HasPiece(e.Index) {
-		return // redundant have - already counted, dont inflate availability
+		return // redundant have - already counted, don't inflate availability
 	}
 	p.have.SetPiece(e.Index)
 	c.incAvailability(e.Index)
@@ -146,7 +152,6 @@ func (c *Coordinator) handlePieceDownloaded(ctx context.Context, e PieceDownload
 	c.pieces[e.Index] = pieceComplete
 	c.cancelOtherAssignees(e.Index, e.Addr)
 	delete(c.assignments, e.Index)
-	delete(c.assignedAt, e.Index)
 	if p, ok := c.peers[e.Addr]; ok {
 		p.assigned = -1
 	}
@@ -161,7 +166,6 @@ func (c *Coordinator) handlePieceFailed(e PieceFailed) {
 	c.removeAssignee(e.Index, e.Addr)
 	if len(c.assignments[e.Index]) == 0 {
 		c.pieces[e.Index] = pieceMissing
-		delete(c.assignedAt, e.Index)
 	}
 	if p, ok := c.peers[e.Addr]; ok {
 		p.assigned = -1
@@ -179,9 +183,9 @@ func (c *Coordinator) handlePeerReady(e PeerReady) {
 	}
 	index, found := c.selectPieceFor(p.have)
 	if !found {
-		return // nothign useful for this peer right now
+		return // nothing useful for this peer right now
 	}
-	c.AssignPiece(e.Addr, p, index)
+	c.assignPiece(e.Addr, p, index)
 }
 
 func (c *Coordinator) handlePeerLeft(e PeerLeft) {
@@ -195,7 +199,6 @@ func (c *Coordinator) handlePeerLeft(e PeerLeft) {
 		c.removeAssignee(p.assigned, e.Addr)
 		if len(c.assignments[p.assigned]) == 0 {
 			c.pieces[p.assigned] = pieceMissing
-			delete(c.assignedAt, p.assigned)
 		}
 	}
 	delete(c.peers, e.Addr)
@@ -211,7 +214,7 @@ func (c *Coordinator) tick() {
 func (c *Coordinator) removeAssignee(index int, addr netip.AddrPort) {
 	assignees := c.assignments[index]
 	for i, a := range assignees {
-		if a == addr {
+		if a.addr == addr {
 			c.assignments[index] = append(assignees[:i], assignees[i+1:]...)
 			return
 		}
