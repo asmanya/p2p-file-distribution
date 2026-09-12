@@ -27,6 +27,10 @@ const listenPort = 6881
 // worth re-announcing to the tracker for a fresh peer list.
 const stallTimeout = 30 * time.Second
 
+// defaultAnnounceInterval is the routine re-announce cadence used until a tracker suggests its own via the
+// announce response's "interval" field - the conventional default real trackers expect a client to fall back on.
+const defaultAnnounceInterval = 30 * time.Minute
+
 // HaveBitfield tracks which pieces are already verified and on disk - the source of truth this client can seed from
 // (phase 10) and what resume uses to skip pieces it doesn't need to re-download. It's written from Download's main
 // goroutine as pieces complete, and will be read from other goroutines once seeding exists - a mutex is simplest and this
@@ -171,6 +175,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	var mu sync.Mutex // guards connected - touched by both announce() and the stall check
 	connected := make(map[netip.AddrPort]bool)
 	minReannounceInterval := stallTimeout
+	announceInterval := defaultAnnounceInterval
 
 	// announce reports our real progress to the tracker and starts a worker for each new peer it returns. Safe
 	// to call more than once; event is EventNone for an ordinary periodic re-announce, and EventStarted/
@@ -190,6 +195,9 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 
 		if resp.MinInterval > 0 {
 			minReannounceInterval = time.Duration(resp.MinInterval) * time.Second
+		}
+		if resp.Interval > 0 {
+			announceInterval = time.Duration(resp.Interval) * time.Second
 		}
 
 		mu.Lock()
@@ -280,6 +288,16 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 					"peers", progress.ActivePeers(),
 					"uploaded_kib", fmt.Sprintf("%.1f", float64(progress.BytesUploaded())/1024),
 				)
+			}
+
+			// Routine re-announce at the tracker's own suggested cadence, regardless of download or seed phase -
+			// a pure seeder (e.g. resumed from already-complete data) otherwise sends exactly one "started"
+			// announce for its entire run and then goes permanently invisible to the tracker the moment that
+			// entry expires or the tracker restarts, which defeats the whole point of seeding: nobody new can
+			// ever find it.
+			if time.Since(lastAnnounce) >= announceInterval {
+				_ = announce(tracker.EventNone) // best-effort - a failed re-announce just means we try again at the next tick
+				lastAnnounce = time.Now()
 			}
 
 		case result := <-resultCh:
