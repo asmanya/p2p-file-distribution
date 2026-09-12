@@ -1,5 +1,23 @@
 # Architecture
 
+The long version. The [README](../README.md) covers what this client
+does and the decisions worth knowing about in a couple of minutes; this
+document is for reading the code afterwards, and covers why each
+package is shaped the way it is, who owns which piece of mutable state,
+and which bugs shaped the current design.
+
+Measured numbers, micro-benchmarks, and profiles live separately in
+[performance.md](performance.md).
+
+**Contents**
+
+- [Layers](#layers) - the seven packages and the one-directional dependency rule
+- [Data flow](#data-flow) - `.torrent` file to bytes on disk, step by step
+- [State ownership](#state-ownership) - every piece of mutable state and who owns it
+- [Error handling philosophy](#error-handling-philosophy) - what returns an error, what panics, what's fatal
+- [Trust boundaries and guards](#trust-boundaries-and-guards) - every untrusted input and the check it gets
+- [Design notes](#design-notes) - package-by-package reasoning
+
 ## Layers
 
 Seven layers. A package can depend on anything listed below it, never on
@@ -17,29 +35,126 @@ anything above.
 ```
 
 `bencode` never references torrents, pieces, or peers. `metainfo` never
-opens a socket or writes to disk. `peer` implements mechanism — sending
-and parsing messages — never policy; deciding which piece to request
-next belongs to `download`. `piece` does no I/O at all: every function
-takes bytes and integers in, returns a value. `cmd` has no logic beyond
-flag parsing and a single call into `internal/download`.
+opens a socket or writes to disk. `peer` implements **mechanism** -
+sending and parsing messages - never **policy**; deciding which piece
+to request next belongs to `download`. `piece` does no I/O at all:
+every function takes bytes and integers in, returns a value. `cmd` has
+no logic beyond flag parsing and a single call into `internal/download`.
+
+## Data flow
+
+`.torrent` file to bytes on disk, in order:
+
+1. **Parse** (`metainfo.ParseFile`) - bencode-decodes the file, builds
+   a typed `Torrent`, computes the info hash two independent ways and
+   cross-checks them.
+2. **Announce** (`tracker.Client.AnnounceAll`) - builds the announce
+   URL from the info hash, peer ID, and port; tries every tracker in
+   `announce-list` in order until one responds; decodes the peer list
+   (compact or legacy format).
+3. **Resume check** (`storage.VerifyExisting`) - re-hashes whatever's
+   already on disk at the output path against the torrent's expected
+   piece hashes; anything that matches is marked complete before a
+   single connection opens.
+4. **Connect** (`peer.Dial` -> `peer.Handshake`) - one worker goroutine
+   per discovered address; a successful handshake hands the connection
+   to `download.runConnection`.
+5. **Select** (`Coordinator.selectPieceFor`) - rarest-first among the
+   pieces that peer's bitfield has and this client doesn't; assigned
+   over that peer's own `commands` channel.
+6. **Download** (`download.Piece` / `downloadBlocks`) - pipelined
+   block requests (`peer.SendRequest`), up to `backlogLimit` in flight
+   at once, assembled into one buffer as `piece` messages arrive.
+7. **Verify** (`piece.Verify`) - SHA-1 over the assembled buffer,
+   checked against the torrent's expected hash for that index.
+8. **Write** (`storage.File.WriteAt`) - a verified piece is written to
+   its exact byte offset in the preallocated output file; unverified
+   data is never written.
+9. **Report** (`Progress`, tracker re-announce) - byte counters update
+   atomically as data moves; the tracker hears `started`/`completed`/
+   `stopped` at the right moments, and routine re-announces in between.
+
+Once every piece is in, steps 5 onward run in reverse for any peer
+that requests a piece this client now has - the same connection, the
+same code path, serving instead of requesting.
 
 ## State ownership
 
 | State | Owner | Notes |
 |-------|-------|-------|
-| `Coordinator.pieces`, `.availability`, `.peers`, `.assignments`, `.endgame` | `Coordinator.Run`'s single goroutine, reached only through its `events` channel | No mutex anywhere in the coordinator — nothing outside that one goroutine ever touches this state |
+| `Coordinator.pieces`, `.availability`, `.peers`, `.assignments`, `.endgame` | `Coordinator.Run`'s single goroutine, reached only through its `events` channel | No mutex anywhere in the coordinator - nothing outside that one goroutine ever touches this state |
 | `resultCh` (verified results) | No owner, but every send from the coordinator races `ctx.Done()` in a `select` | The buffer is small and fixed, not sized to piece count, so an unconditional send could hang forever with no reader during shutdown |
 | `Progress.bytesDownloaded`, `.activePeers`, `.peakPeers`, `.connectAttempts/Successes`, `.hashFailures`, `.panics`, `.duplicateAssignments` | Any worker goroutine, or the coordinator's own goroutine | Plain `sync/atomic` counters, no mutex |
 | `Progress.piecesDone`, `.samples` (rate window) | `Download`'s main goroutine only | Neither a worker nor the coordinator ever touches these |
-| `connected` (dialed peer addresses, inside `Download`) | `Download`'s main goroutine, through the `announce` closure | The mutex is defensive rather than load-bearing — `announce` is only ever called from the main goroutine |
-| `HaveBitfield.bf` (pieces already verified or on disk) | Mutex-guarded | `Download`'s main goroutine writes as pieces complete; every connection goroutine now reads it concurrently (`Has` when serving a request, `Snapshot` when sending our own bitfield) — the concurrent-reader case the mutex was already sized for |
+| `connected` (dialed peer addresses, inside `Download`) | `Download`'s main goroutine, through the `announce` closure | The mutex is defensive rather than load-bearing - `announce` is only ever called from the main goroutine |
+| `HaveBitfield.bf` (pieces already verified or on disk) | Mutex-guarded | `Download`'s main goroutine writes as pieces complete; every connection goroutine now reads it concurrently (`Has` when serving a request, `Snapshot` when sending our own bitfield) - the concurrent-reader case the mutex was already sized for |
 | `storage.File` writes (`WriteAt` per piece) | No owner needed | Each piece owns a disjoint byte range, and positional writes to non-overlapping ranges don't need a lock |
-| `RateTracker.peers` (per-peer rolling download/upload rates) | Mutex-guarded | Written from every connection goroutine as bytes move, read from the coordinator's own goroutine on every choke recalc — genuinely concurrent on both sides, unlike the coordinator's other state |
-| `Coordinator.peerInfo.{interested, choked, peerChoking, gotBitfield}`, `.optimisticAddr`, `.hasOptimistic` | `Coordinator.Run`'s single goroutine | Same invariant as the rest of `Coordinator`'s state — reached only through events, no mutex needed |
-| `Listener.total`, `.perIP` (accepted-connection counters) | Mutex-guarded | `admit`/`release` run from the accept loop and from every connection's own exit path concurrently — a plain counter pair, the case the concurrency rule allows a mutex for |
+| `RateTracker.peers` (per-peer rolling download/upload rates) | Mutex-guarded | Written from every connection goroutine as bytes move, read from the coordinator's own goroutine on every choke recalc - genuinely concurrent on both sides, unlike the coordinator's other state |
+| `Coordinator.peerInfo.{interested, choked, peerChoking, gotBitfield}`, `.optimisticAddr`, `.hasOptimistic` | `Coordinator.Run`'s single goroutine | Same invariant as the rest of `Coordinator`'s state - reached only through events, no mutex needed |
+| `Listener.total`, `.perIP` (accepted-connection counters) | Mutex-guarded | `admit`/`release` run from the accept loop and from every connection's own exit path concurrently - a plain counter pair, the case the concurrency rule allows a mutex for |
 | `Listener.handlers` (accepted-connection `WaitGroup`) | The `Listener` itself; `Add` happens inside `Serve`, before the handler goroutine starts | Keeps the `Add` and the caller's `Wait` from racing, which calling `Add` from inside the handler goroutine itself would risk |
 
+## Error handling philosophy
+
+- **Errors, not panics, for anything untrusted.** Malformed bencode, a
+  corrupt `.torrent`, a hostile peer message - every one of these
+  returns an `error` up the call stack. A panic is reserved for this
+  client's own programming mistakes, never for another party's input.
+- **Wrapped, not swallowed.** Every error that crosses a package
+  boundary is wrapped with `fmt.Errorf("%w", ...)` and enough context
+  to say where it happened, so a failure three layers down still
+  reads clearly at the top.
+- **Distinguishable, not generic.** Connection-refused, handshake
+  timeout, protocol mismatch, and info-hash mismatch are different,
+  named outcomes on purpose - collapsing them into one "connection
+  failed" would make a dead swarm indistinguishable from a real bug.
+- **One goroutine's panic doesn't take the download down.** Every
+  worker recovers from a panic, logs the full stack trace, and counts
+  it, so one malformed message from one bad peer can't crash every
+  other in-flight connection.
+- **A failed peer is not a failed download.** Most tracker-returned
+  addresses are dead or unreachable; most swarms have at least one
+  peer that sends bad data. Both are the expected, normal case
+  (retry, reassign, re-request), not exceptional errors that abort
+  anything.
+- **Fatal is reserved for what actually stops the download.** A disk
+  that can't be written, a torrent file that won't parse, every
+  tracker failing at once - these return an error from `Download`
+  itself; an individual peer or piece failure never does.
+
+## Trust boundaries and guards
+
+Everything crossing into this program from outside is treated as
+hostile until it proves otherwise. The guards, by where the untrusted
+data enters:
+
+| Boundary | Guard |
+|---|---|
+| `.torrent` file (bencode) | String length and dictionary nesting depth capped before allocating; malformed input returns an error, never a panic |
+| `.torrent` file (metainfo) | `name` rejected if empty, absolute, or containing a path separator or leading dot (path traversal); piece count cross-checked against `TotalLength`/`PieceLength` |
+| Tracker response | Request timeout (Go's default HTTP client has none); response body size capped before it's read; non-200 status rejected before the body is parsed as bencode |
+| Peer handshake | Info hash and protocol string checked before this client's own identity is ever sent back; dial and handshake each carry their own deadline |
+| Peer messages | 4-byte length prefix capped before a buffer is allocated for it; every typed payload (`have`, `request`, `piece`, `cancel`) validated against this torrent's actual piece count and piece length before use |
+| Incoming block requests | Bounds-checked against the requested piece's real length, not the torrent's standard length; capped at the standard block size regardless of what's asked for |
+| Disk on resume | Existing data is re-hashed, never assumed correct from a side-channel record; a missing, wrong-size, or corrupt file is treated identically - everything not proven gets re-downloaded |
+
+The one deliberate exception: pieces this client has already
+downloaded and verified this session are trusted without re-hashing
+when served to another peer. They were checked once, at the only
+point corruption could plausibly enter - over the network - and
+re-checking on every serve would cost real CPU for no added safety.
+
 ## Design notes
+
+Package-by-package reasoning, roughly bottom-up:
+
+- **[`internal/bencode`](#internalbencode)** - sealed `Value` interface, guard-before-allocate, canonical encoding.
+- **[`internal/metainfo`](#internalmetainfo)** - bencode tree to typed `Torrent`, path-traversal defense, dual info-hash computation.
+- **[`internal/tracker`](#internaltracker)** - HTTP announce with three network guards, compact/legacy peer formats, multi-tracker fallback.
+- **[`internal/peer`](#internalpeer)** - wire protocol, dial and accept, deadlines, fault-injected connection tests.
+- **[`internal/piece`](#internalpiece)** - pure geometry math and SHA-1 verification, no I/O.
+- **[`internal/download`](#internaldownload)** - the coordinator, both concurrency designs, choking, seeding, resume.
+- **[`internal/storage`](#internalstorage)** - preallocation, positional writes, hash-based resume.
 
 ### internal/bencode
 
@@ -49,7 +164,7 @@ being both exhaustively type-safe and safe against hostile input, since
 `.torrent` files and tracker responses are the first untrusted data it
 touches.
 
-Four concrete types — `ByteString`, `Integer`, `List`, `Dictionary` —
+Four concrete types - `ByteString`, `Integer`, `List`, `Dictionary` -
 satisfy a sealed `Value` interface through an unexported marker method,
 so nothing outside the package can add a fifth. Every type switch on
 `Value` elsewhere in the codebase stays exhaustive without a `default`
@@ -57,7 +172,7 @@ case quietly swallowing a missed type. That was a deliberate choice over
 a reflection-based decoder, which would push the same class of mistake
 to runtime instead of catching it at compile time.
 
-Size and depth guards run before allocation, not after — a string
+Size and depth guards run before allocation, not after - a string
 length or nesting depth gets checked against a fixed cap before any
 buffer exists or any recursive call happens, so an oversized length
 prefix or a deeply nested input costs nothing to reject. Byte strings
@@ -76,7 +191,7 @@ mysterious hash mismatch.
 The real proof of correctness isn't the unit tests, it's the round-trip
 and fuzz tests. Decoding and re-encoding both real `.torrent` fixtures
 byte-for-byte is what demonstrates the encoder is canonical and the
-decoder lossless — exactly what the info-hash computation depends on. A
+decoder lossless - exactly what the info-hash computation depends on. A
 native Go fuzz target, seeded from every known edge case, checks that
 same decode/encode pair under random and mutated input, and confirms
 malformed input always comes back as an error, never a panic.
@@ -89,8 +204,8 @@ identifies a torrent to trackers and peers. No network access, no disk
 writes beyond reading the `.torrent` file itself.
 
 The bencode tree and the `Torrent` struct are deliberately different
-shapes — one generic and nested, the other flat and specific to what a
-torrent actually needs — and `Parse` is the one explicit boundary
+shapes - one generic and nested, the other flat and specific to what a
+torrent actually needs - and `Parse` is the one explicit boundary
 between them, so the tree's general-purpose shape never leaks further
 into the client. `InfoHash` is a fixed-size `[20]byte` rather than a
 slice: comparable with `==`, usable as a map key, its size guaranteed at
@@ -102,7 +217,7 @@ Files are already modeled as a list, even though only single-file
 torrents parse right now. A single-file torrent is just a list with one
 `FileEntry` (`Path` set to the name, `Length` to the total length), so
 adding real multi-file support later means extending that list rather
-than reworking everything — storage offsets included — that assumed
+than reworking everything - storage offsets included - that assumed
 exactly one file.
 
 A torrent's `name` field is untrusted input and gets validated before
@@ -113,7 +228,7 @@ file path, and without it a crafted `.torrent` could use a name like
 `../../.ssh/authorized_keys` to write outside the intended download
 directory.
 
-Piece count is derived and cross-checked rather than trusted as given —
+Piece count is derived and cross-checked rather than trusted as given -
 `ceil(TotalLength / PieceLength)` is compared against the actual number
 of piece hashes present, and a mismatch means the file is corrupt or
 malicious and gets rejected during parsing instead of discovered
@@ -122,7 +237,7 @@ mid-download.
 The info hash is computed two independent ways. Method A re-encodes the
 parsed `info` dictionary through the bencode encoder and hashes that.
 Method B hashes the dictionary's original bytes directly, located
-through byte offsets the decoder records while parsing — a narrow,
+through byte offsets the decoder records while parsing - a narrow,
 justified amendment to `bencode`, which just reports offsets generically
 and has no idea what a caller does with them. `Parse` checks that both
 agree before returning. Right now that check can only ever pass, since
@@ -141,8 +256,8 @@ it should never be deleted.
 ### internal/tracker
 
 Turns a torrent's announce information into a live list of peer
-addresses. Its only job is figuring out who to talk to — it never opens
-a connection to a peer itself — and it treats every response as hostile
+addresses. Its only job is figuring out who to talk to - it never opens
+a connection to a peer itself - and it treats every response as hostile
 until proven otherwise, the same posture `bencode` and `metainfo` take
 toward their own input.
 
@@ -151,7 +266,7 @@ comparable and usable as a map key at zero allocation cost, and it
 represents IPv4 and IPv6 through the same type, both of which matter
 once duplicate peers need deduplicating. The peer ID is generated once
 per session with `crypto/rand`, following the Azureus-style convention
-(`-GO0001-` followed by 12 random bytes) — it's how a tracker tells this
+(`-GO0001-` followed by 12 random bytes) - it's how a tracker tells this
 client's connections apart from everyone else in the swarm, and while
 predictability here doesn't buy an attacker much, crypto-grade
 randomness costs nothing to use anyway.
@@ -159,7 +274,7 @@ randomness costs nothing to use anyway.
 The info hash and peer ID go into the announce URL as raw bytes,
 percent-encoded, never as hex. Go's `net/url` query encoding handles
 arbitrary byte strings correctly on its own. Sending hex is the common
-mistake here — it produces a URL that looks plausible and fails against
+mistake here - it produces a URL that looks plausible and fails against
 every real tracker, since the tracker ends up seeing the wrong 20 bytes
 entirely.
 
@@ -177,7 +292,7 @@ inspecting the actual bencode type of the `peers` value rather than
 trusting that a tracker honored `compact=1`. Real-world trackers
 sometimes ignore that request, and the parser has to survive it rather
 than fail on a torrent that would otherwise work fine. Along the same
-lines, a failed announce to one tracker doesn't fail the whole request —
+lines, a failed announce to one tracker doesn't fail the whole request -
 `announce-list` (BEP-12) gets flattened into an ordered list of URLs and
 tried in order, and a URL with an unsupported scheme (UDP trackers are
 out of scope here) or one that errors is skipped rather than fatal. This
@@ -188,8 +303,8 @@ makes real torrents work at all.
 Integration tests run against a local `httptest` server rather than a
 real tracker. Real trackers are flaky, rate-limit repeated hits, and
 return a different peer list every time, none of which is reproducible
-in CI. A local server can deterministically produce failure modes —
-garbage body, non-200 status, a slow response, an oversized body — that
+in CI. A local server can deterministically produce failure modes -
+garbage body, non-200 status, a slow response, an oversized body - that
 would be impractical to trigger against the real thing on demand. The
 client was separately verified once against a real public tracker
 (Debian's), which returned a genuine list of peers for a real torrent;
@@ -200,7 +315,7 @@ tests.
 
 Implements the BitTorrent wire protocol: pure encoding and decoding of
 handshakes and messages, plus a thin connection layer to exchange them
-over TCP. It carries no download policy — deciding which piece to
+over TCP. It carries no download policy - deciding which piece to
 request next belongs to `download`, not here.
 
 Serialization and parsing are pure functions, kept completely separate
@@ -215,9 +330,9 @@ The connection logic splits into a public `Dial`, which owns the TCP
 connection, and an internal `handshakeOver`, which owns the handshake
 exchange over any `net.Conn`. Production code never sees that split; it
 exists so tests can hand `handshakeOver` one end of an in-memory
-`net.Pipe` instead of a real socket and simulate failure modes — a
+`net.Pipe` instead of a real socket and simulate failure modes - a
 mismatched info hash, a wrong protocol string, a peer that disconnects
-mid-handshake, one that never responds at all — that would be
+mid-handshake, one that never responds at all - that would be
 impractical to trigger against a real connection on demand.
 
 One deadline covers the dial, and a separate one covers the full
@@ -225,14 +340,14 @@ handshake exchange, both the write and the read. A deadline set only
 before the read would still let a peer that accepts a connection and
 never reads hang the write, since a full send buffer blocks `Write` too.
 That handshake deadline gets explicitly cleared the moment the exchange
-succeeds — leaving it in place is the kind of bug that doesn't show up
+succeeds - leaving it in place is the kind of bug that doesn't show up
 until much later, when the same stale deadline fires in the middle of
 unrelated work and looks like an unrelated, intermittent failure.
 
 Connection-refused, handshake timeout, protocol mismatch, and info-hash
 mismatch are distinguishable outcomes, not one generic error. Most
 addresses a tracker hands back belong to peers that are offline,
-unreachable, or gone, which is normal, not a bug — and the only way to
+unreachable, or gone, which is normal, not a bug - and the only way to
 tell "the swarm is mostly dead right now" from "my handshake code is
 broken" is if the failure reasons stay visible instead of collapsing
 into one message.
@@ -247,7 +362,7 @@ connection are. Closing one side makes deadline and I/O calls on the
 other side start failing too, which real sockets don't do. A test that
 closes its fake peer's end right after writing a response can race the
 code under test if that code is still finishing up (clearing its own
-deadline, say) on the other end — the fix is for the test to simply not
+deadline, say) on the other end - the fix is for the test to simply not
 close early, not to add synchronization the production code doesn't
 need.
 
@@ -259,7 +374,7 @@ above rather than an unexplained one.
 
 Keep-alive gets a sentinel message ID rather than being represented as
 `nil`. Returning `nil, nil` from a read function is a classic Go
-footgun — every caller has to remember to check for it, and once
+footgun - every caller has to remember to check for it, and once
 connections run concurrently, the one caller that forgets is a
 nil-pointer panic waiting to happen. A sentinel keeps keep-alive as just
 another case in an exhaustive switch, which the type system helps
@@ -267,7 +382,7 @@ enforce and a missed check can't silently compile away.
 
 Message framing guards the length prefix before allocating a buffer for
 it, the same guard-before-allocate discipline `bencode` established for
-string lengths and nesting depth — a 4-byte prefix claiming gigabytes
+string lengths and nesting depth - a 4-byte prefix claiming gigabytes
 gets rejected on the spot instead of turning into an allocation first.
 Every typed payload parser (`have`, `request`, `piece`) validates a
 peer's numbers against this torrent's actual piece count and piece
@@ -276,7 +391,7 @@ an out-of-range piece index or a block that overruns its piece boundary
 is exactly the kind of message that turns into an out-of-bounds panic if
 it reaches an array unchecked.
 
-A piece bitfield's bit order — piece 0 is the first byte's MSB — is
+A piece bitfield's bit order - piece 0 is the first byte's MSB - is
 pinned by an exhaustive test rather than a couple of spot checks.
 Getting this backwards produces no clear symptom (pieces just look
 unavailable at seemingly random indices), so the test sets every bit in
@@ -287,7 +402,7 @@ The connection wraps a buffered reader specifically to avoid a syscall
 per message. Without it, a message's 4-byte length prefix and its body
 are two separate reads, each a user-space/kernel-space transition, and
 across every message in a real download that adds up. The buffered
-reader is explicitly single-goroutine-owned — not safe to share — which
+reader is explicitly single-goroutine-owned - not safe to share - which
 lines up with each connection eventually belonging to exactly one
 goroutine.
 
@@ -297,14 +412,14 @@ in a single underlying read, and a single message arriving split across
 three separate writes. That's the exact class of bug that never
 reproduces on a fast local network and shows up constantly against a
 real, slightly slow peer. An unrecognized message ID parses successfully
-rather than erroring, since `ReadMessage`'s job is framing — knowing
-where a message ends — not understanding every ID that could appear on
+rather than erroring, since `ReadMessage`'s job is framing - knowing
+where a message ends - not understanding every ID that could appear on
 the wire; rejecting unfamiliar IDs would drop the connection on any peer
 using an extension message this client doesn't implement yet.
 
 Manually verified against a real peer from a live swarm: handshake, a
 full bitfield (3020/3020 pieces for the Debian torrent), a sent
-`interested`, a received `unchoke` — a complete conversation exercising
+`interested`, a received `unchoke` - a complete conversation exercising
 every message type this layer adds, not just the pieces in isolation.
 
 Accepting a connection is the mirror image of dialing one, not a
@@ -335,7 +450,7 @@ exactly one closer.
 ### internal/piece
 
 Piece and block boundary math, plus SHA-1 verification. Every function
-is pure — bytes and integers in, a value out, no I/O — so the geometry
+is pure - bytes and integers in, a value out, no I/O - so the geometry
 everything else depends on can be tested exhaustively on its own.
 
 One set of geometry functions handles every place a piece or block
@@ -343,7 +458,7 @@ boundary is needed: building a request, validating an incoming block,
 sizing a buffer. Duplicating that math at each call site would let an
 off-by-one fix land in one place and silently miss the others. The last
 piece's length gets treated as a first-class test case rather than an
-afterthought — it's shorter than every other piece unless the total
+afterthought - it's shorter than every other piece unless the total
 length happens to divide evenly, and that exact-multiple case is the
 trap, since a naive remainder calculation returns 0 for it instead of a
 full piece.
@@ -353,7 +468,7 @@ separate types rather than one struct. `Work` travels across the worker
 channel and must never be mutated by two goroutines at once; keeping the
 in-flight buffer and byte counters out of it entirely removes the
 possibility instead of relying on discipline. SHA-1 verifies pieces
-because the BitTorrent v1 spec requires it, not as a security choice —
+because the BitTorrent v1 spec requires it, not as a security choice -
 it's cryptographically broken, and both the code and the README say so
 explicitly, since it's the first thing a reviewer will flag.
 
@@ -618,7 +733,7 @@ rather than grown piece by piece. That makes every later piece write a
 plain positional write into already-sized space, and it fails fast if
 the disk can't hold the file at all, well before a large download would
 otherwise discover that at 99%. That preallocation is a sparse file, not
-a real disk-block reservation — `Truncate` sets the file's size in
+a real disk-block reservation - `Truncate` sets the file's size in
 metadata, and disk blocks only get allocated as each region is actually
 written. That's portable through the standard library alone; real
 preallocation needs OS-specific syscalls (`fallocate`, `F_PREALLOCATE`,
@@ -638,7 +753,7 @@ fsync safe.
 Resume keeps no separate metadata file recording completion. Two
 designs were possible: track "pieces done" in a side file, or re-verify
 against the data itself. A side file can drift out of sync with what's
-actually on disk — a crash, a user editing the file, a disk error — and
+actually on disk - a crash, a user editing the file, a disk error - and
 that leaves two sources of truth that can disagree. Re-hashing every
 piece against the `.torrent`'s expected hashes has no such failure mode:
 whatever the data proves is correct by definition, because it's the same
@@ -652,6 +767,6 @@ many in-flight read buffers at once. A semaphore sized to
 a missing file gets the same response as a wrong-size or corrupt one:
 every piece treated as not-yet-downloaded. Guessing at a partial match
 for a file that isn't even the right size risks reading out of bounds or
-verifying against the wrong bytes entirely — the same all-or-nothing
+verifying against the wrong bytes entirely - the same all-or-nothing
 caution this project applies to every other untrusted or unexpected
 input.

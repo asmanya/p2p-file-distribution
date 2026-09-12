@@ -9,39 +9,57 @@ built by hand rather than imported.
 [![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](go.mod)
 [![License: MIT](https://img.shields.io/github/license/asmanya/p2p-file-distribution)](LICENSE)
 
-## Status
-
-Works end to end, in both directions. Give it a `.torrent` file and it
-announces to the tracker, connects to peers concurrently, and picks
-which piece to request next by rarity across the whole swarm rather
-than per connection. Every piece is verified against its SHA-1 hash
-and streamed straight to disk at constant memory. Near the end of a
-download, the last few pieces get requested from every peer that has
-them, and whichever finishes first cancels the rest. An interrupted
-download resumes instead of starting over.
-
-Once every piece is in, the client doesn't exit, it starts seeding.
-Incoming connections are accepted over the same connection loop
-outgoing ones use, since the wire protocol is symmetric the moment a
-handshake finishes. A tit-for-tat choking algorithm decides who gets
-served, with a rotating optimistic slot so a peer with nothing to
-offer yet can still get a chance to start reciprocating.
-
-Verified against a real, independent implementation rather than only
-against itself: Transmission downloaded a complete file from this
-client, and this client downloaded a complete file from Transmission,
-checksums matching both ways. See [Testing](#testing).
-
-Real numbers from actual downloads are in [Performance](#performance).
-
-Not built yet: a real CLI with flags and a progress display, BitTorrent
-v2, and multi-file torrents. See [What's next](#whats-next).
+![Demo: downloading a real Debian ISO from the live public swarm](docs/demo.gif)
 
 ## Quick start
 
+```bash
+git clone https://github.com/asmanya/p2p-file-distribution.git
+cd p2p-file-distribution
+go build -o p2pget ./cmd/p2pget
 ```
-placeholder, arrives with the CLI
+
+```bash
+./p2pget -torrent path/to/file.torrent -out ./downloads
 ```
+
+Add `-seed` to keep seeding once the download finishes. `-h` lists every
+flag (max peers, listen port, log level).
+
+## Features
+
+- **Concurrent, rarest-first downloading.** Connects to peers in
+  parallel and picks the next piece by rarity across the whole swarm,
+  not per connection.
+- **SHA-1 verified, disk-streamed.** Every piece is hash-checked
+  before it's trusted, written straight to disk at constant memory
+  regardless of file size.
+- **Endgame mode.** The last few pieces are requested from every peer
+  that has them; whichever finishes first cancels the rest.
+- **Resume.** An interrupted download picks up where it left off
+  instead of starting over.
+- **Live progress display.** Percent, speed, peers, and ETA update in
+  place, colorized, without scrolling the terminal.
+- **Seeding.** Once every piece is in, the client keeps running and
+  serves other peers - incoming and outgoing connections share the
+  same connection loop.
+- **Tit-for-tat choking.** Decides who gets served, with a rotating
+  optimistic slot so a new peer still gets a chance to start
+  reciprocating.
+- **Graceful shutdown.** A signal stops new work and gives in-flight
+  pieces a short window to land on disk before closing every
+  connection; a second signal forces an immediate exit.
+- **Verified against a real client, not just itself.** Transmission
+  downloaded a complete file from this client, and this client
+  downloaded a complete file from Transmission, checksums matching
+  both ways. See [Testing](#testing).
+
+Real numbers from actual downloads are in [Performance](#performance).
+
+**Not implemented:** BitTorrent v2 / SHA-256 piece hashes, multi-file
+torrents, magnet links (which need DHT-based peer discovery instead of
+a tracker), and multi-torrent sessions in one process. See
+[Known limitations](#known-limitations).
 
 ## Architecture
 
@@ -64,80 +82,88 @@ only package that sees the whole system. Per-package reasoning and who
 owns what shared state live in
 [`docs/architecture.md`](docs/architecture.md).
 
-## Design highlights
+## Design decisions
 
 A few decisions worth calling out here; the rest are in the
 architecture doc.
 
-- No reflection or struct tags for bencode, and no library for it
-  either. A sealed `Value` interface with four concrete types keeps
-  every type switch in the codebase exhaustive by construction.
-- Anything untrusted gets its size checked before it's allocated: a
-  bencode string length, a tracker response body, a peer message.
-  Rejected before it costs memory, not after.
-- The info hash is computed two independent ways and cross-checked, so
-  its correctness doesn't rest on a single code path.
-- Wire formats are pure serialize/parse functions, tested against
-  exact byte fixtures and fault-injected over `net.Pipe`. Malicious
-  peers get simulated, not hoped for.
-- Concurrent downloading is owned by a single goroutine. Every piece's
-  status, its rarity across the swarm, the peer registry, and every
-  in-flight assignment live inside one coordinator, reached only
-  through channels. Nothing needs a mutex, because nothing outside
-  that goroutine ever touches this state.
-- Rarest-first piece selection exists for swarm health, not raw
-  speed. Replicating the pieces only one or two peers hold is what
-  stops a torrent from silently losing data the moment its last
-  holder disconnects. A speed win, if there is one, is a side effect.
-- Duplicate requests for the same piece are prevented by the piece's
-  own state, and every assignment carries a timeout, so a half-open
-  connection that's gone silent can't hold a piece hostage forever.
-- That same duplicate prevention turns off on purpose near the end of
-  a download. The last few pieces get requested from every peer that
-  has them, and the first one to finish cancels the rest, closing the
-  "stuck on one slow peer" tail without waiting it out.
-- Piece-selection policy and connection mechanics are fully separate,
-  so the policy gets tested by feeding it events directly: no
-  network, no timing, no fake peers, the whole suite in milliseconds.
-- A worker's panic gets recovered, loudly (full stack trace, a
-  running counter), so one bad peer can't take the whole download
-  down and the bug still doesn't go unnoticed.
-- SHA-1 verifies pieces because that's what the BitTorrent v1 spec
-  uses, not because it's still considered secure. It's broken, and
-  that's said outright instead of leaving it for a reviewer to point
-  out.
-- Piece writes are positional (`WriteAt`) and don't need a lock.
-  Every piece owns its own byte range, and non-overlapping writes are
-  safe to run concurrently.
-- Resume keeps no separate metadata file. It re-hashes whatever's on
-  disk against the torrent's expected hashes on startup: a match
-  means done, anything else gets re-downloaded. Nothing falls out of
-  sync, because nothing but the file itself is trusted.
-- Seeding reuses the exact same connection loop as downloading rather
-  than a separate one. A TCP connection is bidirectional the instant
-  its handshake finishes, so whichever side dialed stops mattering:
-  the same code accepts a request, applies a choke decision, and
-  fetches a piece, all over one connection, in either direction.
-- Choking is tit-for-tat: whichever four peers are currently giving
-  this client the best download rate get unchoked every ten seconds,
-  everyone else doesn't. A fifth, optimistic slot rotates every thirty
-  seconds to a peer that wouldn't otherwise get a look in, because
-  pure tit-for-tat deadlocks on its own: a peer with nothing to offer
-  yet never gets unchoked, so it never gets the chance to earn
-  anything to offer. Once a download finishes, sorting switches from
-  download rate to upload rate, since download rate means nothing
-  once there's nothing left to request.
-- Per-peer throughput is a rolling window, not a running average, for
-  the same reason rarest-first uses live availability instead of a
-  snapshot: a peer that was fast five minutes ago and has since gone
-  dead needs to stop looking fast immediately, not eventually.
-- Every incoming block request is bounds-checked against that piece's
-  real length, not the torrent's standard piece length. The two only
-  differ for the last piece, and using the wrong one there is exactly
-  the kind of off-by-one that only breaks on the final piece of a
-  download, not the first thousand.
+- **Zero-reflection bencode.** No struct tags, no library. A sealed
+  `Value` interface with four concrete types keeps every type switch
+  exhaustive by construction.
+- **Guard before allocate.** Every untrusted size - a bencode string
+  length, a tracker response body, a peer message - is checked before
+  it costs memory, not after.
+- **Cross-checked info hash.** Computed two independent ways so
+  correctness doesn't rest on a single code path.
+- **Fault-injected wire format.** Serialize/parse are pure functions,
+  tested against exact byte fixtures and over `net.Pipe` against
+  hostile input - bad handshakes, split reads, malicious lengths.
+- **Single-goroutine coordinator.** Piece status, swarm rarity, the
+  peer registry, and every in-flight assignment live in one place,
+  reached only through channels. No mutex, because nothing outside
+  that goroutine ever touches the state.
+- **Rarest-first selection.** For swarm health, not raw speed:
+  replicating the pieces only one or two peers hold is what stops a
+  torrent from losing data if its last holder disconnects.
+- **Timeout-bound assignments.** Duplicate requests for a piece are
+  prevented by the piece's own state, and every assignment times out,
+  so a half-open connection can't hold a piece hostage forever.
+- **Endgame mode.** Duplicate prevention turns off near the end on
+  purpose - the last few pieces go to every peer that has them, first
+  to finish wins, closing the "stuck on one slow peer" tail.
+- **Policy/mechanics separation.** Piece selection is tested by
+  feeding it events directly - no network, no timing, no fake peers,
+  the whole suite runs in milliseconds.
+- **Panic recovery per worker.** Full stack trace plus a running
+  counter, so one bad peer can't take the whole download down, and
+  the failure still doesn't go unnoticed.
+- **Honest about SHA-1.** Used because the BitTorrent v1 spec requires
+  it, not because it's secure - it's broken, and that's stated
+  outright instead of left for a reviewer to catch.
+- **Lock-free positional writes.** `WriteAt` per piece; non-overlapping
+  byte ranges are safe to write concurrently without coordination.
+- **Metadata-free resume.** Re-hashes whatever's on disk against the
+  torrent's expected hashes on startup - a match means done, anything
+  else gets re-downloaded. Nothing but the file itself is trusted.
+- **Shared connection loop.** Seeding reuses the exact same loop as
+  downloading - a TCP connection is bidirectional once the handshake
+  finishes, so the same code serves and requests over one connection.
+- **Tit-for-tat choking.** The four peers giving the best download
+  rate get unchoked every ten seconds; a fifth, rotating optimistic
+  slot breaks the deadlock pure tit-for-tat has on its own (a peer
+  with nothing to offer never earns a chance to offer anything).
+  Sorting switches to upload rate once there's nothing left to request.
+- **Rolling-window rate tracking.** Not a running average - a peer
+  that was fast five minutes ago and has since died needs to stop
+  looking fast immediately, not eventually.
+- **Per-piece bounds checking.** Incoming block requests are validated
+  against that piece's real length, not the torrent's standard length
+  - the two only differ on the last piece, exactly where an off-by-one
+  would otherwise hide until the final piece of a download.
+- **Thin CLI.** `cmd/p2pget` only parses flags into an `Options`
+  struct and calls `download.Download` - nothing in it is worth
+  unit-testing on its own.
+- **Two-context graceful shutdown.** The caller's context (cancelled
+  by a signal) and the context every connection actually watches are
+  decoupled on purpose, so a short grace period can let the system
+  keep running normally - finished pieces still written, tracker still
+  notified - before a hard cancel closes everything.
+- **Centralized config.** Every tunable constant - pipeline depth,
+  choke intervals, timeouts, rate windows - lives in one `config.go`,
+  each with a comment explaining why that value and not another.
 
 ## Performance
+
+Micro-benchmarks and CPU/memory profiles, isolated from network
+variance, live in [`docs/performance.md`](docs/performance.md). The
+headline from those: profiling a real download shows CPU time going to
+network and disk syscalls, not to this client's own selection or
+bookkeeping logic, and rarest-first selection stays sub-millisecond
+even at 50,000 pieces, roughly 15x the largest torrent this client has
+actually downloaded. The numbers below are the other half: end to end,
+against a live public swarm.
+
+### Live download
 
 Measured on a real download of the Debian 13.6.0 netinst ISO (~755
 MiB, 3,020 pieces) from the live public tracker and swarm. Not a
@@ -193,76 +219,100 @@ three live downloads against a public swarm can't honestly support.
 
 ## Testing
 
-Bencode gets table-driven edge cases, byte-exact round-trip tests
-against real `.torrent` files, and a native Go fuzz target seeded
-with every known-bad case. Metainfo is checked against malicious
-filenames and a golden test pinned to ground truth recorded
-independently with `transmission-show`.
+By layer:
 
-The tracker client has `httptest`-based tests for failures a real
-tracker won't reproduce on demand (timeouts, oversized bodies,
-garbage responses), plus a live run against Debian's tracker. Peer
-handling is fault-injected over `net.Pipe`, covering bad handshakes,
-split and merged TCP reads, and hostile length prefixes, and has
-completed real handshakes with qBittorrent, Transmission, Deluge, and
-libtorrent peers in a live swarm.
+- **Bencode** - table-driven edge cases, byte-exact round-trip tests
+  against real `.torrent` files, and a native Go fuzz target seeded
+  with every known-bad case.
+- **Metainfo** - malicious filenames, plus a golden test pinned to
+  ground truth recorded independently with `transmission-show` rather
+  than this project's own output.
+- **Tracker** - `httptest`-based tests for failures a real tracker
+  won't reproduce on demand (timeouts, oversized bodies, garbage
+  responses), plus a live run against Debian's tracker.
+- **Peer** - fault-injected over `net.Pipe`: bad handshakes, split and
+  merged TCP reads, hostile length prefixes. Has completed real
+  handshakes with qBittorrent, Transmission, Deluge, and libtorrent
+  peers in a live swarm.
+- **Piece download** - a fake-seeder state machine (choke/resume,
+  corruption, timeouts), a goroutine-leak test, and a simulated 5-peer
+  swarm with peers that disconnect, corrupt, or drag their feet.
+- **Storage** - out-of-order and concurrent positional writes, the
+  final short piece, and resume against a full, partial, corrupted,
+  missing, and wrong-size file.
+- **Coordinator** - piece-selection policy tested by feeding it events
+  directly: rarest-first selection, duplicate prevention, peer churn,
+  assignment timeouts, end-of-download cancellation. Deterministic and
+  network-free, the whole suite in milliseconds.
 
-Piece download is covered by a fake-seeder state machine
-(choke/resume, corruption, timeouts), a goroutine-leak test, and a
-simulated 5-peer swarm with peers that disconnect, corrupt, or drag
-their feet. Storage gets out-of-order and concurrent positional
-writes, the final short piece, and resume tested against a full,
-partial, corrupted, missing, and wrong-size file. The coordinator's
-piece-selection policy is tested by feeding it events directly:
-rarest-first selection, duplicate prevention, peer churn, assignment
-timeouts, and end-of-download cancellation, all deterministic and
-network-free. The whole suite runs repeatedly under the race
-detector.
+Beyond unit tests:
 
-And end to end: a complete ~755 MiB Debian ISO, downloaded from the
-real swarm, interrupted mid-download and resumed on a second run,
-verified against Debian's published SHA-256.
+- **End to end.** A complete ~755 MiB Debian ISO downloaded from the
+  real swarm, interrupted mid-download and resumed on a second run,
+  verified against Debian's published SHA-256.
+- **Seeding, at the connection level.** A real coordinator, a real
+  `net.Pipe` connection, and a fake incoming leecher that never
+  unchokes back still gets served correctly. That's the direct
+  regression test for three bugs an audit caught right after the
+  choking algorithm first compiled clean: the client never sent its
+  own bitfield, a blocking wait for the peer's own unchoke starved any
+  connection that had nothing to offer it, and incoming requests were
+  dropped whenever a piece download happened to be in flight. None of
+  the three produced an error or a failing test on their own; seeding
+  just quietly did nothing.
+- **Against an independent implementation.** Transmission downloaded a
+  complete file from this client, and this client downloaded a
+  complete file from Transmission, both checksums matching the
+  original exactly. A client tested only against itself can't catch a
+  bug that's wrong the same way on both ends of the wire.
+- **Benchmarked and profiled.** Decode throughput, message
+  serialize/parse cost, SHA-1 verification, and rarest-first selection
+  at piece counts far past anything this client has actually
+  downloaded, all in [`docs/performance.md`](docs/performance.md).
 
-Seeding is tested at the connection level, not only in unit tests: a
-real coordinator, a real `net.Pipe` connection, and a fake incoming
-leecher that never unchokes back still gets served correctly. That's
-the direct regression test for three bugs an audit caught right after
-the choking algorithm first compiled clean: the client never sent its
-own bitfield, a blocking wait for the peer's own unchoke starved any
-connection that had nothing to offer it, and incoming requests were
-silently dropped whenever a piece download happened to be in flight.
-None of the three produced an error or a failing test on their own;
-seeding just quietly did nothing.
-
-Verified once more against a real, independent client, not just
-against itself: Transmission downloaded a complete file from this
-client, and this client downloaded a complete file from Transmission,
-both checksums matching the original exactly. Testing a client against
-itself can't catch a bug that's wrong the same way on both ends of the
-wire; an independent implementation can.
-
-`make check`, format, vet, lint, race, has to pass before anything
+`make check` - format, vet, lint, race - has to pass before anything
 ships.
 
 ## Known limitations
 
-- No UPnP / NAT-PMP. Most home connections sit behind a router, so
+- **No UPnP / NAT-PMP.** Most home connections sit behind a router, so
   nothing on the internet can reach this client's listen port unless
   it's forwarded manually. That's normal network topology, not a bug
   in the listener - automatic port mapping is a separate protocol and
   out of scope for a standard-library-only client. Seeding still works
   fine on localhost and on a LAN.
+- **One torrent per process.** This client serves exactly the one
+  torrent it was started with, matched by a single info hash fixed at
+  startup. It doesn't scan a folder or a database for other torrents
+  it could also be seeding; tracking several at once, each matched by
+  its own info hash as a connection comes in, is a natural extension
+  now that single-torrent seeding works end to end.
+- **No DHT or peer exchange, so no magnet links.** Peer discovery is
+  tracker-only, which means a torrent with no working tracker announce
+  URL has no way to find peers at all, even if the swarm itself is
+  healthy.
+- **Single-file torrents only.** The data model already holds files as
+  a list with one entry, so multi-file support is an extension of that
+  list rather than a rework, but it isn't implemented.
 
-## What's next
+## What I'd do differently
 
-- A real CLI: flags, a live progress display, and graceful shutdown,
-  replacing the log lines this client currently runs behind.
-- BitTorrent v2 / SHA-256 piece hashes, and actual multi-file torrent
-  support (the data model already leaves room for it).
-- Multi-torrent sessions: this client currently serves exactly the
-  one torrent it was started with, matched by a single info hash
-  fixed at startup. It doesn't scan a folder or a database for other
-  torrents it could also be seeding; tracking several active torrents
-  at once, each matched by its own info hash as a connection comes
-  in, is a natural extension now that single-torrent seeding works
-  end to end.
+- **Build the coordinator first.** The work-queue design came first
+  and was replaced. That said, having built both is what turned "the
+  coordinator is better" from an assertion into a measurement: the
+  queue version's numbers are in [Performance](#performance) precisely
+  because it existed long enough to be measured against.
+- **Write `config.go` on day one.** Every constant in it already had a
+  comment explaining its value before it moved there; gathering them
+  into one file at the end cost ten small diffs it would have been
+  cheaper never to need.
+- **Trust the deterministic tests over the live swarm sooner.** Public
+  swarm throughput numbers are noisy, single-sample data points,
+  confounded by which peers happened to be reachable that hour. The
+  network-free tests caught every real regression in this project; the
+  live runs mostly confirmed what those tests already said.
+- **Drive a real end-to-end path earlier after each subsystem.** The
+  worst bugs here (seeding that silently did nothing, a stall timer
+  that could never fire) all compiled cleanly and passed their own
+  unit tests. Each one needed a real connection, with a real peer on
+  the other end, before it became visible at all.
