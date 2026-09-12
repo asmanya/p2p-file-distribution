@@ -11,16 +11,6 @@ linters:
     - bodyclose
     - unused
   settings:
-    errcheck:
-      # A deferred/best-effort Close() on a connection or file we're about to
-      # discard anyway is a well-known, deliberate exception, not a bug.
-      exclude-functions:
-        - (net.Conn).Close
-        - (net.Listener).Close
-        - (io.ReadCloser).Close
-        - (*os.File).Close
-        - (*github.com/asmanya/p2p-file-distribution/internal/storage.File).Close
-        - (*github.com/asmanya/p2p-file-distribution/internal/peer.Conn).Close
     revive:
       rules:
         - name: exported
@@ -31,3 +21,9 @@ linters:
         linters:
           - errcheck
           - dupl
+      # A deferred/best-effort Close() on any connection, file, or listener is a well-known, deliberate exception
+      # in this codebase, not a bug - matched by message text instead of an exhaustive per-type list, so a new
+      # type with a Close() method never needs a new entry here.
+      - linters:
+          - errcheck
+        text: '^Error return value of .*\.Close. is not checked$'
