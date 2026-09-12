@@ -165,18 +165,36 @@ func TestDownloadLocalSwarm(t *testing.T) {
 	tc := tracker.NewClient()
 	outputPath := filepath.Join(t.TempDir(), tor.Name)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := Download(ctx, tor, tc, [20]byte{}, outputPath); err != nil {
-		t.Fatalf("Download: %v", err)
+	done := make(chan error, 1)
+	go func() {
+		done <- Download(ctx, tor, tc, [20]byte{}, outputPath)
+	}()
+
+	// Download no longer returns on its own once every piece is in (Step 10.6: it keeps running as a seeder
+	// until ctx is cancelled), so completion here means "the output file matches the fixture," not "Download
+	// returned." Poll for that instead of waiting out a fixed timeout.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got, err := os.ReadFile(outputPath)
+		if err == nil && bytes.Equal(got, data) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("download did not complete in time")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
-	got, err := os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatalf("read downloaded file: %v", err)
-	}
-	if !bytes.Equal(got, data) {
-		t.Error("downloaded bytes don't match the fixture file")
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Download: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Download did not return after cancellation")
 	}
 }

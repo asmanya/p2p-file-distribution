@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"testing"
 	"time"
@@ -72,7 +73,7 @@ func TestServeRequestSendsBlock(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- serveRequest(conn, payload, pieceCount, pieceLength, totalLength, have, sf, progress)
+		errCh <- serveRequest(conn, netip.AddrPort{}, payload, pieceCount, pieceLength, totalLength, have, sf, progress, nil)
 	}()
 
 	msg, err := peer.ReadMessage(bufio.NewReader(client))
@@ -111,7 +112,7 @@ func TestServeRequestIgnoresChokedPeer(t *testing.T) {
 	defer server.Close()
 	conn := peer.NewConn(server, [20]byte{1}, [8]byte{}) // AmChoking defaults to true
 
-	if err := serveRequest(conn, buildRequestPayload(0, 0, 4), pieceCount, pieceLength, totalLength, have, sf, nil); err != nil {
+	if err := serveRequest(conn, netip.AddrPort{}, buildRequestPayload(0, 0, 4), pieceCount, pieceLength, totalLength, have, sf, nil, nil); err != nil {
 		t.Fatalf("serveRequest: %v", err)
 	}
 
@@ -131,7 +132,7 @@ func TestServeRequestIgnoresMissingPiece(t *testing.T) {
 	conn := peer.NewConn(server, [20]byte{1}, [8]byte{})
 	conn.AmChoking = false
 
-	if err := serveRequest(conn, buildRequestPayload(0, 0, 4), pieceCount, pieceLength, totalLength, have, sf, nil); err != nil {
+	if err := serveRequest(conn, netip.AddrPort{}, buildRequestPayload(0, 0, 4), pieceCount, pieceLength, totalLength, have, sf, nil, nil); err != nil {
 		t.Fatalf("serveRequest: %v", err)
 	}
 
@@ -150,7 +151,7 @@ func TestServeRequestRejectsOutOfRangeIndex(t *testing.T) {
 	conn := peer.NewConn(server, [20]byte{1}, [8]byte{})
 	conn.AmChoking = false
 
-	err := serveRequest(conn, buildRequestPayload(pieceCount, 0, 4), pieceCount, pieceLength, totalLength, have, sf, nil)
+	err := serveRequest(conn, netip.AddrPort{}, buildRequestPayload(pieceCount, 0, 4), pieceCount, pieceLength, totalLength, have, sf, nil, nil)
 	if err == nil {
 		t.Fatal("expected an error for an out-of-range piece index")
 	}
@@ -169,7 +170,7 @@ func TestServeRequestRejectsLastPieceOverrun(t *testing.T) {
 	conn := peer.NewConn(server, [20]byte{1}, [8]byte{})
 	conn.AmChoking = false
 
-	err := serveRequest(conn, buildRequestPayload(2, 5, 10), pieceCount, pieceLength, totalLength, have, sf, nil)
+	err := serveRequest(conn, netip.AddrPort{}, buildRequestPayload(2, 5, 10), pieceCount, pieceLength, totalLength, have, sf, nil, nil)
 	if err == nil {
 		t.Fatal("expected an error for a request overrunning the short last piece")
 	}
@@ -192,7 +193,7 @@ func TestServeRequestRejectsOversizedLength(t *testing.T) {
 
 	// A single 20000-byte piece: begin=0, length=peer.MaxIncomingRequestSize+1 fits within the piece itself, so
 	// only the absolute size cap - not the geometry check - is what should reject this.
-	err = serveRequest(conn, buildRequestPayload(0, 0, peer.MaxIncomingRequestSize+1), 1, 20000, 20000, have, f, nil)
+	err = serveRequest(conn, netip.AddrPort{}, buildRequestPayload(0, 0, peer.MaxIncomingRequestSize+1), 1, 20000, 20000, have, f, nil, nil)
 	if err == nil {
 		t.Fatal("expected an error for a request exceeding MaxIncomingRequestSize")
 	}

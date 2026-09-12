@@ -9,112 +9,56 @@ import (
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
 )
 
-// unchokeTimeout, pieceTimeout, and readTimeout are vars, not consts, so
-// tests can shrink them temporarily instead of waiting out real timeouts.
+// pieceTimeout and readTimeout are vars, not consts, so tests can shrink them temporarily instead of waiting out
+// real timeouts.
 var (
-	unchokeTimeout = 15 * time.Second
-	pieceTimeout   = 30 * time.Second
-	readTimeout    = 15 * time.Second
+	pieceTimeout = 30 * time.Second
+	readTimeout  = 15 * time.Second
 )
 
 const backlogLimit = 5 // TODO: adaptive backlog based on peer speed
 
-var ErrUnchokeTimeout = errors.New("download: peer did not unchoke in time")
 var errCancelled = errors.New("download: piece cancelled")
 var errShutdown = errors.New("download: shutdown")
 
-// EnsureUnchoked sends "interested" (if we haven't already declared it) and
-// blocks until the peer unchokes us, or gives up on us.
+// Piece downloads a single piece over s's connection, blocking until the piece is fully assembled and
+// hash-verified, or an error occurs.
 //
-// This is a one-time, per-connection handshake step, deliberately kept
-// separate from Piece(): a worker downloading many pieces from the same
-// peer only needs to do this once, right after connecting - calling it
-// again before every piece would resend "interested" needlessly and, worse,
-// block waiting for a fresh "unchoke" message a peer that already unchoked
-// us has no reason to send twice.
-func EnsureUnchoked(conn *peer.Conn, messages <-chan peer.Message) error {
-	if !conn.AmInterested {
-		if err := conn.SendInterested(); err != nil {
-			return fmt.Errorf("download: send interested: %w", err)
-		}
-		conn.AmInterested = true
-	}
-
-	if !conn.PeerChoking {
-		return nil // already unchoked - e.g. a prior piece on this same conn
-	}
-
-	return waitForUnchoke(conn, messages)
-}
-
-// Piece downloads a single piece over conn, blocking until the piece is
-// fully assembled and hash-verified, or an error occurs. It assumes the
-// connection is already interested and unchoked - call EnsureUnchoked once
-// per connection before the first call to Piece. pieceCount is the
-// torrent's total piece count, needed to validate incoming have/request/
-// piece messages against this torrent's geometry.
-//
-// A choke arriving mid-download is still handled here (see downloadBlocks) -
-// only the *initial* wait for the first unchoke lives in EnsureUnchoked.
-func Piece(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress, messages <-chan peer.Message, commands <-chan Command, onHave func(index int)) ([]byte, error) {
-	buf, err := downloadBlocks(conn, work, pieceCount, progress, messages, commands, onHave)
+// It does not require the peer to have unchoked us first: if we're choked when it starts, it waits for the
+// unchoke that lets it send requests, bounded by pieceTimeout like everything else here. A choke arriving
+// mid-download is handled the same way, by re-requesting whatever hadn't arrived yet once the peer relents.
+func Piece(s *session, work piece.Work, messages <-chan peer.Message, commands <-chan Command) ([]byte, error) {
+	buf, err := downloadBlocks(s, work, messages, commands)
 	if err != nil {
 		return nil, err
 	}
 
-	// Trust nothing until the bytes match the hash from the .torrent file.
-	// A peer can lie, corrupt data in transit, or send blocks for the wrong
-	// piece entirely - this is the only check that catches all three.
+	// Trust nothing until the bytes match the hash from the .torrent file. A peer can lie, corrupt data in
+	// transit, or send blocks for the wrong piece entirely - this is the only check that catches all three.
 	ok, err := piece.Verify(buf, work.ExpectedHash)
 	if err != nil {
 		return nil, fmt.Errorf("download: piece %d: %w", work.Index, err)
 	}
 	if !ok {
-		progress.HashFailed()
+		s.progress.HashFailed()
 		return nil, fmt.Errorf("download: piece %d: hash mismatch", work.Index)
 	}
 
 	return buf, nil
 }
 
-// waitForUnchoke reads messages until the peer unchokes us, or times out.
-func waitForUnchoke(conn *peer.Conn, messages <-chan peer.Message) error {
-	deadline := time.Now().Add(unchokeTimeout)
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return ErrUnchokeTimeout
-		}
-		select {
-		case msg, ok := <-messages:
-			if !ok {
-				return fmt.Errorf("download: %w", ErrUnchokeTimeout)
-			}
-			switch msg.ID {
-			case peer.MsgUnchoke:
-				conn.PeerChoking = false
-				return nil
-			case peer.MsgChoke:
-				conn.PeerChoking = true
-			}
-		case <-time.After(remaining):
-			return fmt.Errorf("download: %w", ErrUnchokeTimeout)
-		}
-	}
-}
-
-// downloadBlocks requests and assembles every block of work, pipelining up
-// to backlogLimit requests at a time so round-trip latency overlaps across
-// blocks instead of stacking up one request at a time. pieceTimeout bounds
-// the whole call; readTimeout only bounds a single read and is effectively
-// reset every time SetIODeadline is called again below, so a peer that's
-// merely slow (but still making progress) survives, while one that's gone
-// silent gets dropped.
-func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int, progress *Progress, messages <-chan peer.Message, commands <-chan Command, onHave func(index int)) ([]byte, error) {
+// downloadBlocks requests and assembles every block of work, pipelining up to backlogLimit requests at a time so
+// round-trip latency overlaps across blocks instead of stacking up one request at a time. pieceTimeout bounds the
+// whole call; readTimeout only bounds a single read (in readLoop) and is reset on every read, so a peer that's
+// merely slow but still making progress survives, while one that's gone silent gets dropped.
+//
+// Progress is tracked per block, not as a running byte count: a peer that sends the same block twice would
+// otherwise push the count past the piece length while leaving a hole in buf, and a choke arriving after
+// out-of-order blocks would leave the re-request cursor pointing past blocks that never arrived. Both show up
+// only as an unexplained hash failure or a piece that hangs until it times out.
+func downloadBlocks(s *session, work piece.Work, messages <-chan peer.Message, commands <-chan Command) ([]byte, error) {
+	conn := s.conn
 	buf := make([]byte, work.Length)
-	var downloaded int64 // bytes actually copied into buf so far
-	backlog := 0         // requests currently in flight, unanswered
-	nextBlock := 0       // index of the next block we haven't requested yet
 
 	// work.Length is already this piece's resolved (possibly short) length, so BlockCount/BlockBounds are called
 	// as if this were a "torrent" of exactly one piece - reusing the tested geometry math instead of re-deriving
@@ -124,22 +68,32 @@ func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int, progress *
 		return nil, fmt.Errorf("download: piece %d: %w", work.Index, err)
 	}
 
-	// Fixed cap on the whole call, checked once per outer-loop iteration -
-	// this is the "give up no matter what" ceiling, separate from the
-	// per-read idle timeout set just below.
-	pieceDeadline := time.Now().Add(pieceTimeout)
+	requested := make([]bool, numBlocks)
+	received := make([]bool, numBlocks)
+	outstanding := 0 // requests sent but not yet answered
+	remaining := numBlocks
 
-	for downloaded < work.Length {
-		for !conn.PeerChoking && backlog < backlogLimit && nextBlock < numBlocks {
-			offset, length, err := piece.BlockBounds(0, nextBlock, 1, work.Length, work.Length)
+	// Fixed cap on the whole call - the "give up no matter what" ceiling, separate from the per-read idle
+	// timeout readLoop applies. One timer for the call, rather than a fresh time.After on every trip around the
+	// loop, which would pile up a live timer per block.
+	deadline := time.NewTimer(pieceTimeout)
+	defer deadline.Stop()
+
+	for remaining > 0 {
+		for !conn.PeerChoking && outstanding < backlogLimit {
+			next := nextUnrequestedBlock(requested)
+			if next < 0 {
+				break // everything's either in flight or already here
+			}
+			offset, length, err := piece.BlockBounds(0, next, 1, work.Length, work.Length)
 			if err != nil {
 				return nil, fmt.Errorf("download: piece %d: %w", work.Index, err)
 			}
 			if err := conn.SendRequest(work.Index, int(offset), int(length)); err != nil {
-				return nil, fmt.Errorf("download: piece %d: request block %d: %w", work.Index, nextBlock, err)
+				return nil, fmt.Errorf("download: piece %d: request block %d: %w", work.Index, next, err)
 			}
-			backlog++
-			nextBlock++
+			requested[next] = true
+			outstanding++
 		}
 
 		select {
@@ -147,34 +101,60 @@ func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int, progress *
 			if !ok {
 				return nil, fmt.Errorf("download: piece %d: connection closed", work.Index)
 			}
+
 			switch msg.ID {
 			case peer.MsgPiece:
-				p, err := peer.ParsePiecePayload(msg.Payload, pieceCount, int(work.Length))
+				p, err := peer.ParsePiecePayload(msg.Payload, s.pieceCount, int(work.Length))
 				if err != nil {
 					return nil, fmt.Errorf("download: piece %d: %w", work.Index, err)
 				}
 				if p.Index != work.Index {
+					continue // a block for a piece we're not downloading - stale, or meant for someone else
+				}
+				if p.Begin%piece.BlockSize != 0 {
+					continue // unaligned offsets can't be mapped to a block slot; ignore rather than mis-account
+				}
+				block := p.Begin / piece.BlockSize
+				if block < 0 || block >= numBlocks {
 					continue
 				}
+				if outstanding > 0 {
+					outstanding--
+				}
+				if received[block] {
+					continue // duplicate: already counted, and counting it again would corrupt the accounting
+				}
 				copy(buf[p.Begin:], p.Block)
-				downloaded += int64(len(p.Block))
-				progress.AddBytes(len(p.Block))
-				backlog--
+				received[block] = true
+				requested[block] = true
+				remaining--
+				s.progress.AddBytes(len(p.Block))
+				s.rates.AddDownloaded(s.addr, len(p.Block))
 
 			case peer.MsgChoke:
 				conn.PeerChoking = true
-				backlog = 0
-				nextBlock = int(downloaded / piece.BlockSize)
+				outstanding = 0
+				// Anything we asked for but never got has to be asked for again once they relent - only what
+				// actually arrived counts as done.
+				for i := range requested {
+					requested[i] = received[i]
+				}
+				if !s.sendEvent(ChokeReceived{Addr: s.addr}) {
+					return nil, errShutdown
+				}
 
 			case peer.MsgUnchoke:
 				conn.PeerChoking = false
+				if !s.sendEvent(UnchokeReceived{Addr: s.addr}) {
+					return nil, errShutdown
+				}
 
-			case peer.MsgHave:
-				if h, err := peer.ParseHavePayload(msg.Payload, pieceCount); err == nil {
-					conn.PeerBitfield.SetPiece(h.Index)
-					if onHave != nil {
-						onHave(h.Index)
-					}
+			default:
+				// Everything else - their bitfield, haves, interest, and above all the blocks they're asking
+				// us for - goes through the same handler the idle loop uses. Dropping these here is what used
+				// to make this client stop serving anyone the moment it started downloading.
+				if !s.handleMessage(msg) {
+					return nil, fmt.Errorf("download: piece %d: connection closed by handler", work.Index)
 				}
 			}
 
@@ -189,11 +169,30 @@ func downloadBlocks(conn *peer.Conn, work piece.Work, pieceCount int, progress *
 				}
 			case Shutdown:
 				return nil, errShutdown
+			default:
+				// Choke and unchoke decisions must still reach the wire while a piece is in flight - they were
+				// being read off this channel and thrown away, so the coordinator believed it had unchoked
+				// peers it had never actually told.
+				if !s.applyCommand(cmd) {
+					return nil, fmt.Errorf("download: piece %d: connection closed applying command", work.Index)
+				}
 			}
 
-		case <-time.After(time.Until(pieceDeadline)):
+		case <-deadline.C:
 			return nil, fmt.Errorf("download: piece %d timed out", work.Index)
 		}
 	}
+
 	return buf, nil
+}
+
+// nextUnrequestedBlock returns the index of the first block not yet asked for, or -1 if every block is either in
+// flight or already received.
+func nextUnrequestedBlock(requested []bool) int {
+	for i, r := range requested {
+		if !r {
+			return i
+		}
+	}
+	return -1
 }

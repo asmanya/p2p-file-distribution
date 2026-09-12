@@ -44,12 +44,22 @@ func NewConn(conn net.Conn, peerID [20]byte, reserved [8]byte) *Conn {
 	return newConn(conn, peerID, reserved)
 }
 
-// SetIODeadline sets a deadline on the underlying connection for the next
-// read or write. Every network operation on a Conn must go through this -
-// there are no deadline-free reads or writes.
-func (c *Conn) SetIODeadline(d time.Duration) error {
-	if err := c.conn.SetDeadline(time.Now().Add(d)); err != nil {
-		return fmt.Errorf("peer: set deadline: %w", err)
+// SetReadDeadline and SetWriteDeadline bound the next read and the next write independently. They are separate
+// on purpose: a Conn is read by its own goroutine while the connection's main loop writes to it, so a single
+// combined deadline would let a short write deadline silently cut short a long read already in flight - a peer
+// that simply had nothing to say for a few seconds would be dropped as if it had gone silent for the full read
+// timeout. Every network operation on a Conn goes through one of these; there are no deadline-free reads or
+// writes.
+func (c *Conn) SetReadDeadline(d time.Duration) error {
+	if err := c.conn.SetReadDeadline(time.Now().Add(d)); err != nil {
+		return fmt.Errorf("peer: set read deadline: %w", err)
+	}
+	return nil
+}
+
+func (c *Conn) SetWriteDeadline(d time.Duration) error {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(d)); err != nil {
+		return fmt.Errorf("peer: set write deadline: %w", err)
 	}
 	return nil
 }

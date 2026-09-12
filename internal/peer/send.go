@@ -10,7 +10,7 @@ import (
 const writeTimeout = 5 * time.Second
 
 func (c *Conn) send(m Message) error {
-	if err := c.SetIODeadline(writeTimeout); err != nil {
+	if err := c.SetWriteDeadline(writeTimeout); err != nil {
 		return err
 	}
 	return c.SendMessage(m)
@@ -34,6 +34,13 @@ func (c *Conn) SendChoke() error {
 // SendUnchoke tells the peer we're willing to upload to them.
 func (c *Conn) SendUnchoke() error {
 	return c.send(Message{ID: MsgUnchoke})
+}
+
+// SendBitfield tells the peer which pieces we already have. Conventionally the first message sent after the
+// handshake: a peer that never receives one assumes we have nothing, so it never declares interest and never
+// asks us for a single block.
+func (c *Conn) SendBitfield(bf Bitfield) error {
+	return c.send(Message{ID: MsgBitfield, Payload: bf})
 }
 
 // SendHave announces that we've finished downloading and verified piece index.

@@ -19,7 +19,7 @@ import (
 // care about piece indices and coordinator state, never about geometry or actual verification.
 func newTestCoordinator(pieceCount int) (*Coordinator, chan Result) {
 	results := make(chan Result, pieceCount)
-	return NewCoordinator(pieceCount, 1, int64(pieceCount), make([][20]byte, pieceCount), results, nil), results
+	return NewCoordinator(pieceCount, 1, int64(pieceCount), make([][20]byte, pieceCount), results, nil, NewRateTracker()), results
 }
 
 // bitfieldOf builds a peer.Bitfield with exactly the given piece indices set.
@@ -31,12 +31,15 @@ func bitfieldOf(pieceCount int, indices ...int) peer.Bitfield {
 	return bf
 }
 
-// joinPeer registers a peer and delivers its bitfield in one step - most tests below don't care about the two
-// events happening separately, only about the resulting state.
+// joinPeer registers a peer, delivers its bitfield, and has it unchoke us - most tests below don't care about
+// those three events happening separately, only about the resulting state. The unchoke matters: a peer starts
+// out choking us by protocol default, and the coordinator deliberately refuses to hand work to a peer that
+// wouldn't answer the requests.
 func joinPeer(c *Coordinator, addr netip.AddrPort, bf peer.Bitfield) chan Command {
 	commands := make(chan Command, 4)
 	c.handlePeerJoined(PeerJoined{Addr: addr, Commands: commands})
 	c.handleBitfieldReceived(BitfieldReceived{Addr: addr, Bitfield: bf})
+	c.handleUnchokeReceived(UnchokeReceived{Addr: addr})
 	return commands
 }
 
@@ -306,5 +309,89 @@ func TestCoordinatorPeerWithNoUsefulPieceDoesNotBlock(t *testing.T) {
 	case cmd := <-commands:
 		t.Fatalf("expected no command, got %T", cmd)
 	default:
+	}
+}
+
+// --- Scenario 10: a repeated bitfield must not inflate availability -------
+//
+// Availability drives rarest-first. A peer that sends its bitfield twice - by accident or on purpose - would
+// otherwise count every piece it holds twice, quietly skewing which piece this client thinks is rarest.
+func TestCoordinatorRepeatedBitfieldDoesNotDoubleCount(t *testing.T) {
+	c, _ := newTestCoordinator(2)
+	addr := netip.MustParseAddrPort("127.0.0.1:1")
+	joinPeer(c, addr, bitfieldOf(2, 0, 1))
+
+	c.handleBitfieldReceived(BitfieldReceived{Addr: addr, Bitfield: bitfieldOf(2, 0, 1)})
+
+	for i := 0; i < 2; i++ {
+		if c.availability[i] != 1 {
+			t.Errorf("piece %d availability=%d after a repeated bitfield, want 1", i, c.availability[i])
+		}
+	}
+}
+
+// --- Scenario 11: no work for a peer that's choking us -------------------
+func TestCoordinatorDoesNotAssignToAChokingPeer(t *testing.T) {
+	c, _ := newTestCoordinator(1)
+	addr := netip.MustParseAddrPort("127.0.0.1:1")
+	commands := make(chan Command, 4)
+	c.handlePeerJoined(PeerJoined{Addr: addr, Commands: commands})
+	c.handleBitfieldReceived(BitfieldReceived{Addr: addr, Bitfield: bitfieldOf(1, 0)})
+
+	// Peers start out choking us, per the protocol's own default - requests sent now would go unanswered while
+	// holding the piece reserved until it timed out.
+	c.handlePeerReady(PeerReady{Addr: addr})
+	select {
+	case cmd := <-commands:
+		t.Fatalf("assigned %T to a peer that is choking us", cmd)
+	default:
+	}
+
+	c.handleUnchokeReceived(UnchokeReceived{Addr: addr})
+	select {
+	case cmd := <-commands:
+		if _, ok := cmd.(AssignPiece); !ok {
+			t.Fatalf("got %T, want AssignPiece the moment the peer unchoked", cmd)
+		}
+	default:
+		t.Fatal("expected work to be assigned as soon as the peer unchoked")
+	}
+}
+
+// --- Scenario 12: an idle peer gets another chance on the next tick -------
+//
+// Nothing re-offers work when a piece comes free, so a peer that happened to be idle at the one moment it asked
+// for something - every piece it holds already in flight elsewhere - would sit there for the rest of the
+// download. The tick is the safety net.
+func TestCoordinatorTickRecoversAnIdlePeer(t *testing.T) {
+	c, _ := newTestCoordinator(1)
+	addrA := netip.MustParseAddrPort("127.0.0.1:1")
+	addrB := netip.MustParseAddrPort("127.0.0.1:2")
+
+	joinPeer(c, addrA, bitfieldOf(1, 0)) // A takes the only piece
+	commandsB := joinPeer(c, addrB, bitfieldOf(1, 0))
+
+	select {
+	case cmd := <-commandsB:
+		t.Fatalf("B got %T while the piece was still in flight to A", cmd)
+	default:
+	}
+
+	c.handlePeerLeft(PeerLeft{Addr: addrA}) // the piece is free again, but nobody has offered it to B
+	select {
+	case cmd := <-commandsB:
+		t.Fatalf("B got %T without anything re-offering the piece", cmd)
+	default:
+	}
+
+	c.tick()
+
+	select {
+	case cmd := <-commandsB:
+		if _, ok := cmd.(AssignPiece); !ok {
+			t.Fatalf("got %T, want AssignPiece", cmd)
+		}
+	default:
+		t.Fatal("an idle peer holding a piece nobody is fetching never got another chance at it")
 	}
 }

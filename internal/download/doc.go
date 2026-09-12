@@ -10,8 +10,14 @@ package download
 //   - availability.go:   incAvailability/decAvailability/addAvailability/removeAvailability - swarm rarity tracking.
 //   - selection.go:      selectPieceFor() (rarest-first), sendAssignCommand/assignPiece, freeStaleAssignments (per-assignee timeout).
 //   - endgame.go:        remainingPieceCount/maybeEnterEndgame, assignAnyMissingTo (spreads across pieces), cancelOtherAssignees.
-//   - worker.go:         worker() - event-driven per-peer loop, readLoop() - dedicated connection reader goroutine.
-//   - piece.go:          EnsureUnchoked(), Piece()/downloadBlocks() - single-piece download over a messages/commands channel pair.
-//   - progress.go:       Progress - atomic counters (bytes, peers, hash failures, duplicate assignments) + rate window.
-//   - download.go:       Download() - wires coordinator + workers + tracker + storage together, owns disk writes.
+//   - choke.go:          recalcChoke() (tit-for-tat, upload-rate sorted once seeding) + rotateOptimistic(), setChoked().
+//   - rates.go:          RateTracker - per-peer rolling download/upload rates, the choking algorithm's only input.
+//   - serve.go:          serveRequest() - validates an incoming block request, reads it from disk, sends it back.
+//   - worker.go:         worker()/serveIncoming() -> runConnection() - one loop for connections in either direction;
+//                        session + handleMessage() - the single place inbound messages are handled; readLoop().
+//   - piece.go:          Piece()/downloadBlocks() - single-piece download, per-block accounting, delegates every
+//                        non-block message back to the session's handler.
+//   - progress.go:       Progress - atomic counters (bytes up/down, peers, hash failures, duplicate assignments) + rate window.
+//   - download.go:       Download() - wires coordinator + workers + listener + tracker + storage together, owns disk
+//                        writes, and keeps running as a seeder once the last piece lands.
 //   - queue.go:          Result type + resultsBufferSize - what the coordinator hands Download() for disk writes.

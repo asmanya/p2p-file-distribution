@@ -12,7 +12,7 @@ import (
 // rarest-first silently stops meaning anything - this test exists to catch exactly that regression.
 func TestAvailabilityNeverExceedsConnectedPeers(t *testing.T) {
 	const pieceCount = 10
-	c := NewCoordinator(pieceCount, 1, int64(pieceCount), make([][20]byte, pieceCount), make(chan Result, pieceCount), nil)
+	c := NewCoordinator(pieceCount, 1, int64(pieceCount), make([][20]byte, pieceCount), make(chan Result, pieceCount), nil, nil)
 
 	full := make(peer.Bitfield, (pieceCount+7)/8)
 	for i := 0; i < pieceCount; i++ {

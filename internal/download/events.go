@@ -56,13 +56,41 @@ type PeerLeft struct {
 	Reason error
 }
 
-func (PeerJoined) isEvent()       {}
-func (BitfieldReceived) isEvent() {}
-func (HaveReceived) isEvent()     {}
-func (PieceDownloaded) isEvent()  {}
-func (PieceFailed) isEvent()      {}
-func (PeerReady) isEvent()        {}
-func (PeerLeft) isEvent()         {}
+// InterestedReceived reports that a peer has told us it wants to donwload from us - the trigger for chokin got consider
+// unchoking it
+type InterestedReceived struct {
+	Addr netip.AddrPort
+}
+
+// NotInterestedReceived reports that a peer no longer wants anything from us - it drops out of choking consideration
+// immediately, freeing its slot for someone else without waiting for the next 10-second recalc.
+type NotInterestedReceived struct {
+	Addr netip.AddrPort
+}
+
+// ChokeReceived reports that the peer has choked us: nothing we request will be answered until it relents, so
+// the coordinator must stop handing this peer work.
+type ChokeReceived struct {
+	Addr netip.AddrPort
+}
+
+// UnchokeReceived reports that the peer will now answer our requests - the moment this client can actually be
+// given a piece to fetch from it.
+type UnchokeReceived struct {
+	Addr netip.AddrPort
+}
+
+func (ChokeReceived) isEvent()         {}
+func (UnchokeReceived) isEvent()       {}
+func (PeerJoined) isEvent()            {}
+func (BitfieldReceived) isEvent()      {}
+func (HaveReceived) isEvent()          {}
+func (PieceDownloaded) isEvent()       {}
+func (PieceFailed) isEvent()           {}
+func (PeerReady) isEvent()             {}
+func (PeerLeft) isEvent()              {}
+func (InterestedReceived) isEvent()    {}
+func (NotInterestedReceived) isEvent() {}
 
 // Command is what the coordinator tells one peer worker to do next
 type Command interface {
@@ -87,7 +115,15 @@ type Pause struct{}
 // Shutdown tells the worker to close its connection and exit.
 type Shutdown struct{}
 
+// ChokePeer tells the worker to stop uploading to this peer.
+type ChokePeer struct{}
+
+// UnchokePeer tells the worker it may upload to this peer.
+type UnchokePeer struct{}
+
 func (AssignPiece) isCommand() {}
 func (CancelPiece) isCommand() {}
 func (Pause) isCommand()       {}
 func (Shutdown) isCommand()    {}
+func (ChokePeer) isCommand()   {}
+func (UnchokePeer) isCommand() {}

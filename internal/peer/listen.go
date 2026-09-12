@@ -32,6 +32,11 @@ const acceptErrorBackoff = 200 * time.Millisecond
 type Listener struct {
 	ln net.Listener // listening socket
 
+	// handlers counts connection handler goroutines Serve has spawned. Incremented inside Serve, before the
+	// goroutine starts, so a caller that waits on it after Serve returns can never miss a late arrival - doing
+	// the accounting from inside the handler itself would race with that wait.
+	handlers sync.WaitGroup
+
 	mu    sync.Mutex
 	total int                // no. of active connections
 	perIP map[netip.Addr]int // no. of connections to a remote IP
@@ -70,6 +75,9 @@ func (l *Listener) Serve(ctx context.Context, handle func(net.Conn)) {
 			if ctx.Err() != nil {
 				return // listener closed because ctx was cancelled, not a real failure
 			}
+			if errors.Is(err, net.ErrClosed) {
+				return // someone called Close - retrying would spin on the same error forever
+			}
 			slog.Warn("peer: accept error, backing off", "error", err)
 			time.Sleep(acceptErrorBackoff)
 			continue
@@ -80,11 +88,20 @@ func (l *Listener) Serve(ctx context.Context, handle func(net.Conn)) {
 			continue
 		}
 
+		l.handlers.Add(1)
 		go func() {
+			defer l.handlers.Done()
 			defer l.release(conn)
 			handle(conn)
 		}()
 	}
+}
+
+// Wait blocks until every handler goroutine Serve started has returned. Only meaningful after Serve itself has
+// returned - at that point no new handlers can appear, so this is the point where all accepted connections are
+// known to be finished with.
+func (l *Listener) Wait() {
+	l.handlers.Wait()
 }
 
 // admit applies the connection-count guards and, if the connection is accepted, reservers its slot. Returns false if conn should be rejected.

@@ -3,19 +3,20 @@ package download
 import (
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 
 	"github.com/asmanya/p2p-file-distribution/internal/peer"
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
 	"github.com/asmanya/p2p-file-distribution/internal/storage"
 )
 
-// ServeRequest handles one incoming block request from a peer we're uploading to: validates it, checks we're willing and able to
-// serve it, reds the block from disk, and sends it back.
+// serveRequest handles one incoming block request from a peer we're uploading to: validates it, checks we're willing and able to
+// serve it, reads the block from disk, and sends it back.
 //
 // A request we deliberately decline - the peer is choked, or we don't have the piece yet - is not an error and returns nil, the
 // peer just never gets a reply for it, same as any real BitTorrent client would do. Only a real failure (malformed payload, disk
 // error, write error) is returned, since those are only cases worth tearing down the connection over.
-func serveRequest(conn *peer.Conn, payload []byte, pieceCount int, pieceLength, totalLength int64, have *HaveBitfield, file *storage.File, progress *Progress) error {
+func serveRequest(conn *peer.Conn, addr netip.AddrPort, payload []byte, pieceCount int, pieceLength, totalLength int64, have *HaveBitfield, file *storage.File, progress *Progress, rates *RateTracker) error {
 	if len(payload) != 12 {
 		return fmt.Errorf("download: request payload length %d, want 12", len(payload))
 	}
@@ -56,5 +57,6 @@ func serveRequest(conn *peer.Conn, payload []byte, pieceCount int, pieceLength, 
 	}
 
 	progress.AddUploadedBytes(len(block))
+	rates.AddUploaded(addr, len(block))
 	return nil
 }
