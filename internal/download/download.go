@@ -11,6 +11,7 @@ import (
 
 	"github.com/asmanya/p2p-file-distribution/internal/metainfo"
 	"github.com/asmanya/p2p-file-distribution/internal/peer"
+	"github.com/asmanya/p2p-file-distribution/internal/piece"
 	"github.com/asmanya/p2p-file-distribution/internal/storage"
 	"github.com/asmanya/p2p-file-distribution/internal/tracker"
 )
@@ -94,6 +95,12 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	have := NewHaveBitfield(pieceCount)
 	completed := 0
 
+	// bytesOwned is how much of the file we actually have on disk, resumed and freshly-downloaded pieces alike -
+	// what the tracker's "left" field needs. progress.BytesDownloaded() alone would be wrong here: it only counts
+	// bytes fetched over the network *this session*, so a fully-resumed torrent would report the same "left" as
+	// a torrent that had downloaded nothing at all.
+	var bytesOwned int64
+
 	resultCh := make(chan Result, resultsBufferSize)
 	rates := NewRateTracker()
 	coordinator := NewCoordinator(pieceCount, tor.PieceLength, tor.TotalLength, tor.PiecesHashes, resultCh, progress, rates)
@@ -103,9 +110,14 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	// coordinator simply never offers them to anyone
 	for i := 0; i < pieceCount; i++ {
 		if verifiedPieces[i] {
+			length, err := piece.Length(i, pieceCount, tor.PieceLength, tor.TotalLength)
+			if err != nil {
+				return fmt.Errorf("download: resumed piece %d: %w", i, err)
+			}
 			coordinator.MarkComplete(i)
 			have.Set(i)
 			completed++
+			bytesOwned += length
 			progress.PieceCompleted() // so Percent()/ETA() reflect resumed progress from the start, not just this session's
 		}
 	}
@@ -160,11 +172,17 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	connected := make(map[netip.AddrPort]bool)
 	minReannounceInterval := stallTimeout
 
-	// announce asks the tracker for peers and starts a worker for each one, we haven't already connected to.
-	// Safe to call more than once.
-	announce := func() error {
+	// announce reports our real progress to the tracker and starts a worker for each new peer it returns. Safe
+	// to call more than once; event is EventNone for an ordinary periodic re-announce, and EventStarted/
+	// EventCompleted/EventStopped for the three moments the spec actually wants to hear about.
+	announce := func(event string) error {
 		resp, err := tc.AnnounceAll(tor.Announce, tor.AnnounceList, func(trackerURL string) (string, error) {
-			return tracker.BuildAnnounceURL(trackerURL, tor.InfoHash, peerID, listenPort, tor.TotalLength)
+			left := tor.TotalLength - bytesOwned
+			if left < 0 {
+				left = 0
+			}
+			return tracker.BuildAnnounceURL(trackerURL, tor.InfoHash, peerID, listenPort,
+				progress.BytesUploaded(), progress.BytesDownloaded(), left, event)
 		})
 		if err != nil {
 			return err
@@ -190,9 +208,19 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 		return nil
 	}
 
-	if err := announce(); err != nil {
+	if err := announce(tracker.EventStarted); err != nil {
 		return fmt.Errorf("download: initial announce: %w", err)
 	}
+	started := true
+	// A graceful exit tells the tracker we're gone - real trackers use this to drop us from the peer list
+	// immediately instead of waiting out a stale entry's timeout. Best-effort: a failed stopped announce isn't
+	// worth turning a clean shutdown into an error over, and there's nothing to tell the tracker if we never
+	// managed to tell it we'd started in the first place.
+	defer func() {
+		if started {
+			_ = announce(tracker.EventStopped)
+		}
+	}()
 
 	lastProgress := time.Now()
 	lastAnnounce := time.Now()
@@ -241,7 +269,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 				stalled := time.Since(lastProgress) >= stallTimeout
 				allowedToReannounce := time.Since(lastAnnounce) >= minReannounceInterval
 				if stalled && allowedToReannounce {
-					_ = announce() // best-effort - a failed re-announce just means we try again at the next tick
+					_ = announce(tracker.EventNone) // best-effort - a failed re-announce just means we try again at the next tick
 					lastAnnounce = time.Now()
 				}
 			} else if time.Since(lastSeedLog) >= 10*time.Second {
@@ -260,6 +288,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			}
 			have.Set(result.Index)
 			completed++
+			bytesOwned += int64(len(result.Data))
 			progress.PieceCompleted()
 			lastProgress = time.Now()
 
@@ -268,6 +297,14 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 				if err := sf.Sync(); err != nil {
 					return fmt.Errorf("download: sync output file: %w", err)
 				}
+
+				// Best-effort, like every other announce: a tracker that gets this drops us onto its seeder
+				// list, which is how new leechers find us. Without it, nothing outside this process can tell
+				// seeding has even started.
+				if err := announce(tracker.EventCompleted); err != nil {
+					slog.Warn("download: completed announce failed", "error", err)
+				}
+				lastAnnounce = time.Now()
 
 				elapsed := time.Since(start)
 				attempts, successes := progress.ConnectStats()

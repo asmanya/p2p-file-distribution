@@ -19,5 +19,6 @@ package download
 //                        non-block message back to the session's handler.
 //   - progress.go:       Progress - atomic counters (bytes up/down, peers, hash failures, duplicate assignments) + rate window.
 //   - download.go:       Download() - wires coordinator + workers + listener + tracker + storage together, owns disk
-//                        writes, and keeps running as a seeder once the last piece lands.
+//                        writes, and keeps running as a seeder once the last piece lands. Reports real uploaded/
+//                        downloaded/left to the tracker on every announce, with started/completed/stopped events.
 //   - queue.go:          Result type + resultsBufferSize - what the coordinator hands Download() for disk writes.

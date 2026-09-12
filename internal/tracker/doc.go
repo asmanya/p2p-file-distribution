@@ -15,8 +15,9 @@ package tracker
 //
 // File by file:
 //   - peerid.go:   GeneratePeerID() - this client's 20-byte identity, once per session.
-//   - request.go:  BuildAnnounceURL() - turns (announce URL, info hash, peer ID, port, left)
-//                  into the full GET URL, percent-encoding the raw binary fields.
+//   - request.go:  BuildAnnounceURL() - turns (announce URL, info hash, peer ID, port,
+//                  uploaded, downloaded, left, event) into the full GET URL, percent-encoding
+//                  the raw binary fields. Event{None,Started,Completed,Stopped} constants.
 //   - response.go: ParseAnnounceResponse() - bencode dict -> AnnounceResponse struct,
 //                  handling both compact (byte-string) and legacy (dict-list) peer formats.
 //   - client.go:   Client.Announce() - the actual HTTP GET, with timeout, size cap, and
