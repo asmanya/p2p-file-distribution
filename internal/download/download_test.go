@@ -72,7 +72,7 @@ func TestDownloadCleansUpOnCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		Download(ctx, tor, tc, [20]byte{}, outputPath)
+		Download(ctx, tor, tc, [20]byte{}, outputPath, Options{})
 	}()
 
 	time.Sleep(50 * time.Millisecond) // let Download start and dial attempts begin

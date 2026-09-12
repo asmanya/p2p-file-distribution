@@ -3,6 +3,7 @@ package download
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/asmanya/p2p-file-distribution/internal/peer"
@@ -41,6 +42,7 @@ func Piece(s *session, work piece.Work, messages <-chan peer.Message, commands <
 	}
 	if !ok {
 		s.progress.HashFailed()
+		slog.Warn("piece: hash mismatch, peer sent bad data", "peer", s.addr, "index", work.Index)
 		return nil, fmt.Errorf("download: piece %d: hash mismatch", work.Index)
 	}
 

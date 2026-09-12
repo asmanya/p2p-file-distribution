@@ -78,7 +78,8 @@ func worker(ctx context.Context, addr netip.AddrPort, infoHash, peerID [20]byte,
 	progress.ConnectAttempted()
 	conn, err := peer.Dial(addr.String(), infoHash, peerID)
 	if err != nil {
-		return // dead peer - expected, nothing to log loudly about here
+		slog.Debug("worker: dial failed", "peer", addr, "error", err) // expected - most tracker-returned peers are dead
+		return
 	}
 	progress.ConnectSucceeded()
 
@@ -112,6 +113,8 @@ func runConnection(ctx context.Context, conn *peer.Conn, addr netip.AddrPort, pi
 	defer conn.Close()
 	progress.PeerConnected()
 	defer progress.PeerDisconnected()
+	slog.Info("peer: connected", "addr", addr)
+	defer slog.Info("peer: disconnected", "addr", addr)
 
 	events := coordinator.Events()
 	sendEvent := func(ev Event) bool {
@@ -262,9 +265,12 @@ func (s *session) applyCommand(cmd Command) bool {
 // the coordinator needs to know and serving anything the peer asked us for. Returns false if the connection
 // should be torn down.
 func (s *session) handleMessage(msg peer.Message) bool {
+	slog.Debug("peer: message received", "addr", s.addr, "type", msg.ID)
+
 	switch msg.ID {
 	case peer.MsgBitfield:
 		if err := peer.Validate(peer.Bitfield(msg.Payload), s.pieceCount); err != nil {
+			slog.Warn("peer: invalid bitfield, closing connection", "addr", s.addr, "error", err)
 			return false // a bitfield that doesn't match this torrent's geometry is a protocol error
 		}
 		s.conn.PeerBitfield = peer.Bitfield(msg.Payload)
@@ -273,6 +279,7 @@ func (s *session) handleMessage(msg peer.Message) bool {
 	case peer.MsgHave:
 		h, err := peer.ParseHavePayload(msg.Payload, s.pieceCount)
 		if err != nil {
+			slog.Warn("peer: out-of-range have, ignoring", "addr", s.addr, "error", err)
 			return true // out-of-range have from a buggy peer: ignore the message, keep the connection
 		}
 		s.conn.PeerBitfield.SetPiece(h.Index)
@@ -299,6 +306,9 @@ func (s *session) handleMessage(msg peer.Message) bool {
 			return true
 		}
 		err := serveRequest(s.conn, s.addr, msg.Payload, s.pieceCount, s.seed.PieceLength, s.seed.TotalLength, s.seed.Have, s.seed.File, s.progress, s.rates)
+		if err != nil {
+			slog.Warn("peer: bad request, closing connection", "addr", s.addr, "error", err)
+		}
 		return err == nil // malformed or oversized request - this peer is misbehaving, not worth keeping open
 
 	case peer.MsgCancel:

@@ -1,6 +1,9 @@
 package download
 
 import (
+	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -19,6 +22,12 @@ type Progress struct {
 	bytesUploaded   int64 // atomic
 	activePeers     int64 // atomic
 	peakPeers       int64 // atomic - highest activePeers has ever reached
+
+	// uploadSamples backs UploadRate the same way samples backs Rate, but AddUploadedBytes is called from every
+	// peer's own connection goroutine while seeding - genuinely concurrent, unlike piecesDone/samples below which
+	// only the main download goroutine ever touches - so this one needs its own mutex.
+	uploadMu      sync.Mutex
+	uploadSamples []rateSample
 
 	connectAttempts  int64 // atomic
 	connectSuccesses int64 // atomic
@@ -64,7 +73,22 @@ func (p *Progress) AddUploadedBytes(n int) {
 	if p == nil {
 		return
 	}
-	atomic.AddInt64(&p.bytesUploaded, int64(n))
+	total := atomic.AddInt64(&p.bytesUploaded, int64(n))
+
+	p.uploadMu.Lock()
+	p.uploadSamples = recordAndPrune(p.uploadSamples, total)
+	p.uploadMu.Unlock()
+}
+
+// UploadRate returns the current upload rate in bytes/second, computed over the last rateWindow. Safe to call
+// concurrently.
+func (p *Progress) UploadRate() float64 {
+	if p == nil {
+		return 0
+	}
+	p.uploadMu.Lock()
+	defer p.uploadMu.Unlock()
+	return rateFromSamples(p.uploadSamples)
 }
 
 // BytesUploaded returns the current total. Safe to call concurrently.
@@ -192,28 +216,40 @@ func (p *Progress) PieceCompleted() {
 }
 
 func (p *Progress) recordSample() {
-	now := time.Now()
-	p.samples = append(p.samples, rateSample{at: now, bytes: p.BytesDownloaded()})
-
-	// moving window implementation - removing old samples
-	cutoff := now.Add(-rateWindow)
-	i := 0
-	for i < len(p.samples) && p.samples[i].at.Before(cutoff) {
-		i++
-	}
-	p.samples = p.samples[i:]
+	p.samples = recordAndPrune(p.samples, p.BytesDownloaded())
 }
 
 // Rate returns the current download rate in bytes/second, computed over the last rateWindow - not since the
 // download started, which would keep remembering a slow start forever.
 func (p *Progress) Rate() float64 {
-	if p == nil || len(p.samples) < 2 {
+	if p == nil {
 		return 0
 	}
-	first, last := p.samples[0], p.samples[len(p.samples)-1]
-	// recordSample only prunes stale samples when a new one arrives, so during a real stall (no piece completing at
-	// all) the window never advances - without this check, Rate would keep reporting whatever it last computed
-	// instead of admitting nothing recent has happened.
+	return rateFromSamples(p.samples)
+}
+
+// recordAndPrune appends one sample and drops everything older than rateWindow - the moving-window implementation
+// shared by Progress's download-rate and upload-rate tracking.
+func recordAndPrune(samples []rateSample, bytes int64) []rateSample {
+	now := time.Now()
+	samples = append(samples, rateSample{at: now, bytes: bytes})
+
+	cutoff := now.Add(-rateWindow)
+	i := 0
+	for i < len(samples) && samples[i].at.Before(cutoff) {
+		i++
+	}
+	return samples[i:]
+}
+
+// rateFromSamples computes bytes/second across a sample window. Returns 0 if there aren't at least two samples, or
+// if the newest one is stale (a real stall, not just a slow window) - without that check, a rate would keep
+// reporting whatever it last computed instead of admitting nothing recent has happened.
+func rateFromSamples(samples []rateSample) float64 {
+	if len(samples) < 2 {
+		return 0
+	}
+	first, last := samples[0], samples[len(samples)-1]
 	if time.Since(last.at) > rateWindow {
 		return 0
 	}
@@ -244,4 +280,68 @@ func (p *Progress) ETA(totalBytes int64) time.Duration {
 		remaining = 0
 	}
 	return time.Duration(remaining/rate) * time.Second
+}
+
+// barWidth is the fixed character width of the progress bar itself, not counting the surrounding brackets or the
+// status text - wide enough to read at a glance, narrow enough to fit one terminal line alongside that text.
+const barWidth = 40
+
+// ANSI escape codes for the progress display - raw sequences, no library needed. Windows Terminal and modern
+// PowerShell/conhost interpret these by default; a plain-text viewer (output piped to a file, say) just sees a
+// few extra bytes around otherwise-readable text, so this degrades safely instead of breaking anything.
+const (
+	ansiReset   = "\x1b[0m"
+	ansiBold    = "\x1b[1m"
+	ansiGreen   = "\x1b[32m"
+	ansiCyan    = "\x1b[36m"
+	ansiYellow  = "\x1b[33m"
+	ansiMagenta = "\x1b[35m"
+	ansiGray    = "\x1b[90m"
+)
+
+// Render returns a multi-line, colorized status block: the bar (or a "SEEDING" header) on its own line, followed
+// by a small aligned table of the underlying numbers. Every line starts with an ANSI "clear line" code so
+// re-printing this block in place (see the redraw closure in download.go) never leaves stale characters behind
+// when a line gets shorter than it was on the previous tick.
+func (p *Progress) Render(totalBytes int64, seeding bool) []string {
+	const clear = "\x1b[2K"
+
+	// Blank rows (top, between the header and the table, and bottom) visually separate this block from the plain
+	// slog lines around it (the resume/completion messages) - every row is redrawn every tick regardless of
+	// content, so these need to be part of the slice like any other line, not printed once and forgotten.
+	if seeding {
+		uploaded := p.BytesUploaded()
+		var ratio float64
+		if totalBytes > 0 {
+			ratio = float64(uploaded) / float64(totalBytes)
+		}
+		return []string{
+			"",
+			clear + fmt.Sprintf("%s%sSEEDING%s", ansiBold, ansiGreen, ansiReset),
+			"",
+			clear + fmt.Sprintf("  %-10s %s%d%s", "Peers", ansiMagenta, p.ActivePeers(), ansiReset),
+			clear + fmt.Sprintf("  %-10s %s%.1f KiB/s%s", "Upload", ansiGreen, p.UploadRate()/1024, ansiReset),
+			clear + fmt.Sprintf("  %-10s %.1f MiB", "Uploaded", float64(uploaded)/(1024*1024)),
+			clear + fmt.Sprintf("  %-10s %s%.2f%s", "Ratio", ansiYellow, ratio, ansiReset),
+			"",
+		}
+	}
+
+	filled := int(p.Percent() / 100 * barWidth)
+	if filled > barWidth {
+		filled = barWidth
+	}
+	bar := ansiGreen + strings.Repeat("=", filled) + ansiReset +
+		ansiGray + strings.Repeat(" ", barWidth-filled) + ansiReset
+
+	return []string{
+		"",
+		clear + fmt.Sprintf("[%s] %s%5.1f%%%s", bar, ansiBold, p.Percent(), ansiReset),
+		"",
+		clear + fmt.Sprintf("  %-10s %d/%d", "Pieces", p.piecesDone, p.PieceCount),
+		clear + fmt.Sprintf("  %-10s %s%.1f KiB/s%s", "Speed", ansiCyan, p.Rate()/1024, ansiReset),
+		clear + fmt.Sprintf("  %-10s %s%d%s", "Peers", ansiMagenta, p.ActivePeers(), ansiReset),
+		clear + fmt.Sprintf("  %-10s %s%s%s", "ETA", ansiYellow, p.ETA(totalBytes).Round(time.Second), ansiReset),
+		"",
+	}
 }

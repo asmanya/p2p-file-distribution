@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
@@ -20,8 +21,19 @@ import (
 // printed - workers never print directly (see worker.go).
 const progressLogInterval = 1 * time.Second
 
-// listenPort is what we advertise to the tracker and what we actually bind for incoming connections.
-const listenPort = 6881
+// defaultMaxPeers is the concurrent-connection cap used when Options.MaxPeers is left at its zero value, so callers
+// that don't care about the limit (existing tests, for instance) don't have to think about it.
+const defaultMaxPeers = 50
+
+// Options holds the per-run settings a caller (currently just cmd/p2pget) supplies on top of the torrent itself.
+type Options struct {
+	// Port is what we advertise to the tracker and what we actually bind for incoming connections.
+	Port int
+	// MaxPeers caps how many peer connections run concurrently. Zero means defaultMaxPeers.
+	MaxPeers int
+	// Seed keeps the download running as a seeder once every piece is in, instead of returning immediately.
+	Seed bool
+}
 
 // stallTimeout is how long the download can go without a single piece completing before it's considered stalled and
 // worth re-announcing to the tracker for a fresh peer list.
@@ -80,10 +92,15 @@ func (h *HaveBitfield) Count() int {
 //
 // Before requesting anything, it verifies whatever data already exists at outputPath and skips pieces that already match
 // their expected hash - this is the entire resume mechanism, with no separate metadata file.
-func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, peerID [20]byte, outputPath string) error {
+func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, peerID [20]byte, outputPath string, opts Options) error {
 	start := time.Now()
 	pieceCount := tor.PieceCount()
 	progress := NewProgress(pieceCount)
+
+	maxPeers := opts.MaxPeers
+	if maxPeers <= 0 {
+		maxPeers = defaultMaxPeers
+	}
 
 	sf, err := storage.Create(outputPath, tor.TotalLength)
 	if err != nil {
@@ -145,7 +162,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	// Accept incoming connections too, so peers that connect to us can be served from disk - a listener failing
 	// to bind (e.g. the port is already taken by another instance) only disables seeding to new inbound peers,
 	// it doesn't fail the download: outgoing connections still work exactly as before.
-	if listener, err := peer.Listen(fmt.Sprintf(":%d", listenPort)); err != nil {
+	if listener, err := peer.Listen(fmt.Sprintf(":%d", opts.Port)); err != nil {
 		slog.Warn("download: could not start listener, incoming connections disabled", "error", err)
 	} else {
 		defer listener.Close()
@@ -177,6 +194,11 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	minReannounceInterval := stallTimeout
 	announceInterval := defaultAnnounceInterval
 
+	// sem caps how many outgoing peer connections run at once. A non-blocking acquire that just skips the peer on
+	// failure - rather than blocking the announce goroutine until a slot frees up - keeps announce() itself fast,
+	// and leaving that peer out of connected means the next announce naturally retries it once a slot opens up.
+	sem := make(chan struct{}, maxPeers)
+
 	// announce reports our real progress to the tracker and starts a worker for each new peer it returns. Safe
 	// to call more than once; event is EventNone for an ordinary periodic re-announce, and EventStarted/
 	// EventCompleted/EventStopped for the three moments the spec actually wants to hear about.
@@ -186,7 +208,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			if left < 0 {
 				left = 0
 			}
-			return tracker.BuildAnnounceURL(trackerURL, tor.InfoHash, peerID, listenPort,
+			return tracker.BuildAnnounceURL(trackerURL, tor.InfoHash, peerID, opts.Port,
 				progress.BytesUploaded(), progress.BytesDownloaded(), left, event)
 		})
 		if err != nil {
@@ -206,10 +228,16 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 			if connected[addr] {
 				continue
 			}
+			select {
+			case sem <- struct{}{}:
+			default:
+				continue // at the concurrency cap - left unconnected so a later announce can retry it
+			}
 			connected[addr] = true
 			wg.Add(1)
 			go func(addr netip.AddrPort) {
 				defer wg.Done()
+				defer func() { <-sem }()
 				worker(ctx, addr, tor.InfoHash, peerID, pieceCount, coordinator, progress, rates, seed)
 			}(addr)
 		}
@@ -241,16 +269,38 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 	// client that exits the instant it finishes downloading can never actually seed anyone.
 	downloadComplete := completed == pieceCount
 	if downloadComplete {
+		if !opts.Seed {
+			slog.Info("download already complete from resumed data, seeding not requested (-seed=false)")
+			cancel()
+			wg.Wait()
+			return nil
+		}
 		// Resume found every piece already verified on disk - there's no result left to arrive on resultCh, so
 		// the transition below (which only fires when a fresh result completes the last piece) would otherwise
 		// never run and this client would idle forever without ever entering seed mode.
 		slog.Info("download already complete from resumed data, seeding immediately")
 	}
-	var lastSeedLog time.Time
+	// linesDrawn tracks how many lines the last progress block wrote, so the next redraw knows how far to move the
+	// cursor back up. It resets to 0 whenever a slog line needs to interrupt the block (completion, shutdown) so
+	// that line lands on its own row instead of the next redraw overwriting it.
+	linesDrawn := 0
+	redraw := func(lines []string) {
+		if linesDrawn > 0 {
+			fmt.Fprintf(os.Stderr, "\x1b[%dA", linesDrawn)
+		}
+		for _, line := range lines {
+			fmt.Fprintln(os.Stderr, line)
+		}
+		linesDrawn = len(lines)
+	}
+	endBlock := func() {
+		linesDrawn = 0
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			endBlock()
 			cancel()
 			wg.Wait()
 			if !downloadComplete {
@@ -260,13 +310,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 
 		case <-progressTicker.C:
 			if !downloadComplete {
-				slog.Info("download progress",
-					"percent", fmt.Sprintf("%.1f%%", progress.Percent()),
-					"pieces", fmt.Sprintf("%d/%d", completed, pieceCount),
-					"rate_kib_s", fmt.Sprintf("%.1f", progress.Rate()/1024),
-					"peers", progress.ActivePeers(),
-					"eta", progress.ETA(tor.TotalLength).Round(time.Second),
-				)
+				redraw(progress.Render(tor.TotalLength, false))
 
 				// Checked here, on the same 1-second ticker, rather than a separate time.After(stallTimeout) case: a
 				// fresh time.After call re-armed on every trip around this select would never survive the 30 seconds it
@@ -280,14 +324,8 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 					_ = announce(tracker.EventNone) // best-effort - a failed re-announce just means we try again at the next tick
 					lastAnnounce = time.Now()
 				}
-			} else if time.Since(lastSeedLog) >= 10*time.Second {
-				// Once a second would spam the log over a long-running seed - 10 seconds matches the choking
-				// algorithm's own recalc interval, so this reads as "one line per choke decision."
-				lastSeedLog = time.Now()
-				slog.Info("seeding",
-					"peers", progress.ActivePeers(),
-					"uploaded_kib", fmt.Sprintf("%.1f", float64(progress.BytesUploaded())/1024),
-				)
+			} else {
+				redraw(progress.Render(tor.TotalLength, true))
 			}
 
 			// Routine re-announce at the tracker's own suggested cadence, regardless of download or seed phase -
@@ -312,6 +350,7 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 
 			if completed == pieceCount && !downloadComplete {
 				downloadComplete = true
+				endBlock()
 				if err := sf.Sync(); err != nil {
 					return fmt.Errorf("download: sync output file: %w", err)
 				}
@@ -342,6 +381,13 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 					"panics_recovered", progress.Panics(),
 					"duplicate_assignments", progress.DuplicateAssignments(),
 				)
+
+				if !opts.Seed {
+					slog.Info("download complete, seeding not requested (-seed=false), shutting down")
+					cancel()
+					wg.Wait()
+					return nil
+				}
 				slog.Info("seeding: download complete, continuing to serve peers until stopped")
 			}
 		}

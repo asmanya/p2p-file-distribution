@@ -64,7 +64,7 @@ func TestDownloadReportsTrackerEvents(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Download(ctx, tor, tc, [20]byte{}, outputPath)
+		done <- Download(ctx, tor, tc, [20]byte{}, outputPath, Options{Seed: true})
 	}()
 
 	// Wait for the file itself to land - Download keeps running as a seeder afterward (Step 10.6), so it never

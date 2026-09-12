@@ -170,7 +170,7 @@ func TestDownloadLocalSwarm(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Download(ctx, tor, tc, [20]byte{}, outputPath)
+		done <- Download(ctx, tor, tc, [20]byte{}, outputPath, Options{Seed: true})
 	}()
 
 	// Download no longer returns on its own once every piece is in (Step 10.6: it keeps running as a seeder

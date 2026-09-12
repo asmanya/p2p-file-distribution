@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"log/slog"
 	"net/netip"
 	"time"
 
@@ -220,6 +221,7 @@ func (c *Coordinator) handlePieceDownloaded(ctx context.Context, e PieceDownload
 }
 
 func (c *Coordinator) handlePieceFailed(e PieceFailed) {
+	slog.Warn("coordinator: piece failed, reassigning", "peer", e.Addr, "index", e.Index, "error", e.Reason)
 	c.removeAssignee(e.Index, e.Addr)
 	if len(c.assignments[e.Index]) == 0 {
 		c.pieces[e.Index] = pieceMissing
