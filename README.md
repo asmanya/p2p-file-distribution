@@ -11,18 +11,31 @@ built by hand rather than imported.
 
 ## Status
 
-Works end to end. Give it a `.torrent` file and it announces to the
-tracker, connects to peers concurrently, and picks which piece to
-request next by rarity across the whole swarm rather than per
-connection. Every piece is verified against its SHA-1 hash and streamed
-straight to disk at constant memory. Near the end of a download, the
-last few pieces get requested from every peer that has them, and
-whichever finishes first cancels the rest. An interrupted download
-resumes instead of starting over. Real numbers from actual downloads
-are in [Performance](#performance).
+Works end to end, in both directions. Give it a `.torrent` file and it
+announces to the tracker, connects to peers concurrently, and picks
+which piece to request next by rarity across the whole swarm rather
+than per connection. Every piece is verified against its SHA-1 hash
+and streamed straight to disk at constant memory. Near the end of a
+download, the last few pieces get requested from every peer that has
+them, and whichever finishes first cancels the rest. An interrupted
+download resumes instead of starting over.
 
-Not built yet: seeding, choking, and a CLI. See
-[What's next](#whats-next).
+Once every piece is in, the client doesn't exit, it starts seeding.
+Incoming connections are accepted over the same connection loop
+outgoing ones use, since the wire protocol is symmetric the moment a
+handshake finishes. A tit-for-tat choking algorithm decides who gets
+served, with a rotating optimistic slot so a peer with nothing to
+offer yet can still get a chance to start reciprocating.
+
+Verified against a real, independent implementation rather than only
+against itself: Transmission downloaded a complete file from this
+client, and this client downloaded a complete file from Transmission,
+checksums matching both ways. See [Testing](#testing).
+
+Real numbers from actual downloads are in [Performance](#performance).
+
+Not built yet: a real CLI with flags and a progress display, BitTorrent
+v2, and multi-file torrents. See [What's next](#whats-next).
 
 ## Quick start
 
@@ -100,6 +113,29 @@ architecture doc.
   disk against the torrent's expected hashes on startup: a match
   means done, anything else gets re-downloaded. Nothing falls out of
   sync, because nothing but the file itself is trusted.
+- Seeding reuses the exact same connection loop as downloading rather
+  than a separate one. A TCP connection is bidirectional the instant
+  its handshake finishes, so whichever side dialed stops mattering:
+  the same code accepts a request, applies a choke decision, and
+  fetches a piece, all over one connection, in either direction.
+- Choking is tit-for-tat: whichever four peers are currently giving
+  this client the best download rate get unchoked every ten seconds,
+  everyone else doesn't. A fifth, optimistic slot rotates every thirty
+  seconds to a peer that wouldn't otherwise get a look in, because
+  pure tit-for-tat deadlocks on its own: a peer with nothing to offer
+  yet never gets unchoked, so it never gets the chance to earn
+  anything to offer. Once a download finishes, sorting switches from
+  download rate to upload rate, since download rate means nothing
+  once there's nothing left to request.
+- Per-peer throughput is a rolling window, not a running average, for
+  the same reason rarest-first uses live availability instead of a
+  snapshot: a peer that was fast five minutes ago and has since gone
+  dead needs to stop looking fast immediately, not eventually.
+- Every incoming block request is bounds-checked against that piece's
+  real length, not the torrent's standard piece length. The two only
+  differ for the last piece, and using the wrong one there is exactly
+  the kind of off-by-one that only breaks on the final piece of a
+  download, not the first thousand.
 
 ## Performance
 
@@ -187,12 +223,46 @@ And end to end: a complete ~755 MiB Debian ISO, downloaded from the
 real swarm, interrupted mid-download and resumed on a second run,
 verified against Debian's published SHA-256.
 
+Seeding is tested at the connection level, not only in unit tests: a
+real coordinator, a real `net.Pipe` connection, and a fake incoming
+leecher that never unchokes back still gets served correctly. That's
+the direct regression test for three bugs an audit caught right after
+the choking algorithm first compiled clean: the client never sent its
+own bitfield, a blocking wait for the peer's own unchoke starved any
+connection that had nothing to offer it, and incoming requests were
+silently dropped whenever a piece download happened to be in flight.
+None of the three produced an error or a failing test on their own;
+seeding just quietly did nothing.
+
+Verified once more against a real, independent client, not just
+against itself: Transmission downloaded a complete file from this
+client, and this client downloaded a complete file from Transmission,
+both checksums matching the original exactly. Testing a client against
+itself can't catch a bug that's wrong the same way on both ends of the
+wire; an independent implementation can.
+
 `make check`, format, vet, lint, race, has to pass before anything
 ships.
 
+## Known limitations
+
+- No UPnP / NAT-PMP. Most home connections sit behind a router, so
+  nothing on the internet can reach this client's listen port unless
+  it's forwarded manually. That's normal network topology, not a bug
+  in the listener - automatic port mapping is a separate protocol and
+  out of scope for a standard-library-only client. Seeding still works
+  fine on localhost and on a LAN.
+
 ## What's next
 
-- Seeding, a choking algorithm, and a real CLI with a progress
-  display.
+- A real CLI: flags, a live progress display, and graceful shutdown,
+  replacing the log lines this client currently runs behind.
 - BitTorrent v2 / SHA-256 piece hashes, and actual multi-file torrent
   support (the data model already leaves room for it).
+- Multi-torrent sessions: this client currently serves exactly the
+  one torrent it was started with, matched by a single info hash
+  fixed at startup. It doesn't scan a folder or a database for other
+  torrents it could also be seeding; tracking several active torrents
+  at once, each matched by its own info hash as a connection comes
+  in, is a natural extension now that single-torrent seeding works
+  end to end.

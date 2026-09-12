@@ -32,8 +32,12 @@ flag parsing and a single call into `internal/download`.
 | `Progress.bytesDownloaded`, `.activePeers`, `.peakPeers`, `.connectAttempts/Successes`, `.hashFailures`, `.panics`, `.duplicateAssignments` | Any worker goroutine, or the coordinator's own goroutine | Plain `sync/atomic` counters, no mutex |
 | `Progress.piecesDone`, `.samples` (rate window) | `Download`'s main goroutine only | Neither a worker nor the coordinator ever touches these |
 | `connected` (dialed peer addresses, inside `Download`) | `Download`'s main goroutine, through the `announce` closure | The mutex is defensive rather than load-bearing — `announce` is only ever called from the main goroutine |
-| `HaveBitfield.bf` (pieces already verified or on disk) | Mutex-guarded | Only the main goroutine writes today, as pieces complete; seeding will add concurrent readers later, so the mutex is already in place |
+| `HaveBitfield.bf` (pieces already verified or on disk) | Mutex-guarded | `Download`'s main goroutine writes as pieces complete; every connection goroutine now reads it concurrently (`Has` when serving a request, `Snapshot` when sending our own bitfield) — the concurrent-reader case the mutex was already sized for |
 | `storage.File` writes (`WriteAt` per piece) | No owner needed | Each piece owns a disjoint byte range, and positional writes to non-overlapping ranges don't need a lock |
+| `RateTracker.peers` (per-peer rolling download/upload rates) | Mutex-guarded | Written from every connection goroutine as bytes move, read from the coordinator's own goroutine on every choke recalc — genuinely concurrent on both sides, unlike the coordinator's other state |
+| `Coordinator.peerInfo.{interested, choked, peerChoking, gotBitfield}`, `.optimisticAddr`, `.hasOptimistic` | `Coordinator.Run`'s single goroutine | Same invariant as the rest of `Coordinator`'s state — reached only through events, no mutex needed |
+| `Listener.total`, `.perIP` (accepted-connection counters) | Mutex-guarded | `admit`/`release` run from the accept loop and from every connection's own exit path concurrently — a plain counter pair, the case the concurrency rule allows a mutex for |
+| `Listener.handlers` (accepted-connection `WaitGroup`) | The `Listener` itself; `Add` happens inside `Serve`, before the handler goroutine starts | Keeps the `Add` and the caller's `Wait` from racing, which calling `Add` from inside the handler goroutine itself would risk |
 
 ## Design notes
 
@@ -303,6 +307,31 @@ full bitfield (3020/3020 pieces for the Debian torrent), a sent
 `interested`, a received `unchoke` — a complete conversation exercising
 every message type this layer adds, not just the pieces in isolation.
 
+Accepting a connection is the mirror image of dialing one, not a
+separate protocol. `Listener` runs one accept loop behind three
+guards that all exist for the same reason `bencode`'s size caps and
+`peer`'s message-length check do: an unbounded resource handed to
+untrusted input becomes a denial of service. A cap on total accepted
+connections, a cap per remote IP, and a short backoff after a run of
+accept errors, so a peer that opens hundreds of connections or an
+`fd`-exhaustion loop can't spend this process's file descriptors or
+its CPU. `Accept` then runs the handshake in the opposite order from
+`Dial`: an outgoing connection already knows which torrent it wants,
+so it speaks first; an incoming one has no idea until the remote side
+says so, so it listens first and only sends its own handshake back
+once the info hash checks out. That ordering is also a small security
+property, not just a protocol necessity: a mismatched info hash means
+this client's peer ID and torrent metadata never went out over an
+unverified connection at all.
+
+`Accept` deliberately does not close the connection on error the way
+`handshakeOver` does. `Dial` owns the connection it creates end to
+end, so closing on failure is its job; an accepted connection is
+already owned by `Listener`, which closes it in `release` the moment
+the handler returns regardless of why. Having both close it would
+just be redundant, not incorrect, but the ownership is cleaner with
+exactly one closer.
+
 ### internal/piece
 
 Piece and block boundary math, plus SHA-1 verification. Every function
@@ -455,6 +484,127 @@ rather than the torrent's total size, for a related reason: a resumed
 download's elapsed time only covers the pieces it actually fetched,
 so dividing the whole file's size by that time would overstate
 throughput by however much resume skipped.
+
+Seeding did not need a second connection loop. A TCP connection is
+bidirectional the moment its handshake finishes, so a peer this client
+dialed to download from can just as legitimately request a piece back
+over the same connection, and a peer that connected in to download
+from this client can just as legitimately be asked for a piece it
+holds. `worker` (dials) and `serveIncoming` (already accepted) both
+just hand their connection to one shared `runConnection`, which makes
+no distinction between the two once it starts. Every inbound message,
+whichever direction the connection came from, funnels through one
+`session.handleMessage`, deliberately singular, because an earlier
+version handled messages in two different places (the idle loop and
+the in-flight single-piece download loop), and the second one quietly
+dropped every incoming block request and every choke/unchoke command
+that arrived while a piece happened to be downloading. Consolidating
+to one handler wasn't a style preference; it was the fix.
+
+Choking reuses the coordinator rather than adding a second
+single-owner goroutine next to it. The decision is the same shape as
+piece selection: which commands to send which peers, over the same
+per-peer channel `peerInfo` already holds. `recalcChoke` runs every
+ten seconds, unchoking whichever four interested peers currently have
+the best rate and choking everyone else; `rotateOptimistic` runs
+independently every thirty, unconditionally unchoking one more
+interested-but-choked peer so pure tit-for-tat's own deadlock (a peer
+with nothing to offer never gets unchoked, so never gets the chance to
+earn anything to offer) can't happen. Both write through one shared
+`setChoked`, which only sends a command when a peer's choke state
+actually changes and updates the coordinator's own record of it in the
+same place, so a slow peer's full command channel can never leave the
+coordinator's belief out of sync with what was actually sent. A
+`RateTracker` (mutex-guarded, since it's genuinely written and read
+from different goroutines, unlike the rest of the coordinator's state)
+is the algorithm's whole input: a rolling window per peer per
+direction, the same fixed-window approach `Progress.Rate` already
+used, so a peer that was fast five minutes ago and has gone silent
+since stops looking fast immediately rather than eventually. Once
+`remainingPieceCount` reaches zero, `recalcChoke` switches from
+sorting by download rate to upload rate, since download rate means
+nothing once nothing is being requested.
+
+Serving one incoming request is `serveRequest`, and the geometry trap
+here is the mirror of the one `piece`'s tests already pin for
+downloading: a request has to be bounds-checked against the piece it
+actually names, not the torrent's standard piece length, because the
+two only differ for the last, shorter piece, and the naive version
+would wrongly accept an out-of-range offset there. The index has to be
+read out of the raw payload before that length is even knowable, so
+validation happens in two passes: peek the index, look up its real
+length, then parse and bounds-check the rest against that. A request
+larger than the standard 16 KB block gets rejected outright, the same
+trust-boundary posture every untrusted input in this project gets. No
+separate per-peer request queue exists on purpose: requests are served
+synchronously, one at a time, on that peer's own connection goroutine,
+so a peer that fires ten thousand requests has nowhere to queue them
+in the first place, not a queue this client has to remember to cap.
+
+A full audit after the choking algorithm first compiled and passed
+its own unit tests found seeding did nothing end to end, silently.
+Nine bugs, none of which produced an error: this client never sent
+its own bitfield, so no peer had a reason to ever ask it for a block;
+a leftover blocking wait for the remote peer's own unchoke gated the
+entire connection loop, so a peer that connected purely to download
+(and so had no reason to ever unchoke this client back) got dropped
+after a timeout without being served a single block; incoming
+requests and choke commands were dropped during an in-flight piece
+download, described above; a bitfield sent as the very first message
+after a handshake could be silently discarded by the same code that
+treated it as "not a bitfield, ignore"; `readLoop` leaked one goroutine
+per finished connection, because closing a socket doesn't wake a
+goroutine already blocked sending its last message into a channel
+nobody's reading from anymore; a single combined read/write deadline
+let one direction's timeout quietly cut the other short, since the
+reader and the connection's own writer are different goroutines
+sharing one `net.Conn`; a peer that was interested could still never
+be given work if it was also choking this client back, because nothing
+checked that before assigning; an idle peer that asked for work at the
+one moment every piece it held was already in flight elsewhere never
+got asked again once one came free, since nothing re-offers work on
+its own; and a duplicate bitfield from the same peer double-counted
+every piece it held into swarm-wide availability. None of the nine had
+a failing test pointing at them; the whole class only became visible
+by driving a real coordinator over a real connection and checking that
+a leecher which never reciprocates still gets served, which is now a
+permanent regression test rather than a one-time finding.
+
+Real tracker reporting replaced placeholder `uploaded=0`/`downloaded=0`
+values with the running totals `Progress` already tracked, plus the
+`started`/`completed`/`stopped` events the spec expects at exactly
+those three moments and no others. The `left` field needed its own
+counter rather than reusing `Progress.BytesDownloaded`, which only
+counts bytes fetched over the network this session: a torrent resumed
+from already-complete data would otherwise report "everything is still
+missing" to the tracker despite having the whole file, since resumed
+bytes never touch that counter. A separate `bytesOwned`, incremented
+for both resumed and freshly-downloaded pieces, is what `left` is
+computed from instead. A pure seeder resumed from complete data
+originally announced `started` exactly once and then never again,
+which is invisible until the one tracker that ever heard about it
+loses its state (a restart, a crash) and no new leecher can find this
+client until the process itself restarts. Routine re-announcing at the
+tracker's own suggested interval now runs in both the downloading and
+the seeding phase, independent of the download phase's own
+stall-triggered early re-announce.
+
+The client was verified against Transmission, a real and independent
+implementation, in both directions: Transmission downloaded a complete
+file from this client, and this client downloaded a complete file from
+Transmission, both checksums matching the original exactly. Testing
+against itself specifically can't catch a bug that's wrong the same
+way on both ends of the wire (a backwards bitfield bit order would
+send and receive backwards identically and still pass); an independent
+implementation is what actually certifies the wire format, not just
+this client's own consistency with itself. One genuine, non-code
+finding came out of running that test over loopback: Transmission
+silently discards any peer address in `127.0.0.0/8`, treating it as
+bogus, since a real tracker would never legitimately hand out a
+loopback address for another machine's peer. That's correct behavior
+on Transmission's part, not a bug on either side, and it only matters
+for same-machine interop testing, where the fix is to advertise the
+machine's real LAN address instead of localhost.
 
 ### internal/storage
 
