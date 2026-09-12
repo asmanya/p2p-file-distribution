@@ -5,23 +5,7 @@ import (
 	"math/rand/v2"
 	"net/netip"
 	"sort"
-	"time"
 )
-
-// chokeInterval and optimisticInterval are vars, not consts, so tests can shrink them instead of waiting out a
-// real 10- or 30-second cycle - the same reason readTimeout and pieceTimeout are vars.
-var (
-	// chokeInterval is how often the tit-for-tat decision recalculates - the top unchokeSlots interested peers by
-	// rate get unchoked, everyone else choked, 10 seconds matches the spec's convention.
-	chokeInterval = 10 * time.Second
-
-	// optimisticInterval is how often the optimistic-unchoke slot rotates to a new random peer, independent of the
-	// regular recalc's own cycle.
-	optimisticInterval = 30 * time.Second
-)
-
-// unchokeSlots is how many interested peers the regular (non-optimistic) algorithm keeps unchoked at once.
-const unchokeSlots = 4
 
 func (c *Coordinator) handleInterestedReceived(e InterestedReceived) {
 	if p, ok := c.peers[e.Addr]; ok {

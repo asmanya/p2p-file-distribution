@@ -17,14 +17,6 @@ import (
 	"github.com/asmanya/p2p-file-distribution/internal/tracker"
 )
 
-// progressLogInterval is how often Download logs a progress line while running. This is the only place progress is
-// printed - workers never print directly (see worker.go).
-const progressLogInterval = 1 * time.Second
-
-// defaultMaxPeers is the concurrent-connection cap used when Options.MaxPeers is left at its zero value, so callers
-// that don't care about the limit (existing tests, for instance) don't have to think about it.
-const defaultMaxPeers = 50
-
 // Options holds the per-run settings a caller (currently just cmd/p2pget) supplies on top of the torrent itself.
 type Options struct {
 	// Port is what we advertise to the tracker and what we actually bind for incoming connections.
@@ -34,14 +26,6 @@ type Options struct {
 	// Seed keeps the download running as a seeder once every piece is in, instead of returning immediately.
 	Seed bool
 }
-
-// stallTimeout is how long the download can go without a single piece completing before it's considered stalled and
-// worth re-announcing to the tracker for a fresh peer list.
-const stallTimeout = 30 * time.Second
-
-// defaultAnnounceInterval is the routine re-announce cadence used until a tracker suggests its own via the
-// announce response's "interval" field - the conventional default real trackers expect a client to fall back on.
-const defaultAnnounceInterval = 30 * time.Minute
 
 // HaveBitfield tracks which pieces are already verified and on disk - the source of truth this client can seed from
 // (phase 10) and what resume uses to skip pieces it doesn't need to re-download. It's written from Download's main

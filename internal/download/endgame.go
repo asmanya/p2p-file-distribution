@@ -2,11 +2,6 @@ package download
 
 import "net/netip"
 
-// endgameThreshold is how many pieces may remain incomplete before endgame mode kicks in - low enough that assigning
-// every remaining piece to every peer that has it only costs a small, bounded amount of duplicate bandwidth, high
-// enough to actually eliminate the "last piece stuck on one slow peer" tail latency problem.
-const endgameThreshold = 10
-
 // remainingPieceCount counts every piece that isn't complete yet - missing and in-flight alike. Counting only
 // pieceMissing here would be wrong: a piece already assigned to someone is still outstanding work, and ignoring it
 // would let endgame trigger while far more than endgameThreshold pieces are actually left, needlessly widening

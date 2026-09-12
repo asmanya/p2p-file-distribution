@@ -21,4 +21,6 @@ package download
 //   - download.go:       Download() - wires coordinator + workers + listener + tracker + storage together, owns disk
 //                        writes, and keeps running as a seeder once the last piece lands. Reports real uploaded/
 //                        downloaded/left to the tracker on every announce, with started/completed/stopped events.
-//   - queue.go:          Result type + resultsBufferSize - what the coordinator hands Download() for disk writes.
+//   - queue.go:          Result type - what the coordinator hands Download() for disk writes.
+//   - config.go:         every tunable constant this package uses, one place, each with a WHY comment - pipeline
+//                        depth, choke/optimistic intervals, endgame threshold, every timeout, rate windows.

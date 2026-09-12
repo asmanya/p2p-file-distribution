@@ -9,10 +9,6 @@ import (
 	"github.com/asmanya/p2p-file-distribution/internal/peer"
 )
 
-// coordinatorTickInterval is how often Run wakes up on its own, independent of incoming events, for stall detection and
-// stats work added in later steps.
-const coordinatorTickInterval = 1 * time.Second
-
 // pieceState is the coordinator's own view of one piece, independent of any single peer's bitfield.
 type pieceState int
 

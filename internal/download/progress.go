@@ -8,10 +8,6 @@ import (
 	"time"
 )
 
-// rateWindow bounds how far back Rate() looks when computing current throughput - a moving window, not a cumulative
-// average, so the number reflects current speed, not a memory of however the download started.
-const rateWindow = 10 * time.Second
-
 // Progress tracks live download progress. bytesDownloaded and activePeers are updated from many worker goroutines
 // concurrently, so they're atomic; everything else (piecesDone, the rate samples) is touched only by the main
 // download goroutine

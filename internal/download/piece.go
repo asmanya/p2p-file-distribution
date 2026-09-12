@@ -10,15 +10,6 @@ import (
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
 )
 
-// pieceTimeout and readTimeout are vars, not consts, so tests can shrink them temporarily instead of waiting out
-// real timeouts.
-var (
-	pieceTimeout = 30 * time.Second
-	readTimeout  = 15 * time.Second
-)
-
-const backlogLimit = 5 // TODO: adaptive backlog based on peer speed
-
 var errCancelled = errors.New("download: piece cancelled")
 var errShutdown = errors.New("download: shutdown")
 

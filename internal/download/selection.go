@@ -10,12 +10,6 @@ import (
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
 )
 
-// assignmentTimeout is how long a single assignee stays in flight before the coordinator gives up on it and frees
-// that assignee's slot for someone else. Without this, a half-open TCP connection - one where the peer is gone but
-// the OS hasn't noticed yet - would hold a piece hostage forever, and the download would stall at 99% with no
-// error and no log to explain why.
-const assignmentTimeout = 30 * time.Second
-
 // selectPieceFor picks the best piece to assign a peer with the given bitfield: among pieces that are (a) missing,
 // (b) not already in flight, and (c) present in have, it picks the one with the lowest availability - the piece closest
 // to disappearing from the swarm entirely if its last holder leaves. Ties are broken randomly (reservoir sampling of one)

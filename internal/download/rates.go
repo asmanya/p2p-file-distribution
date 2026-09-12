@@ -6,11 +6,6 @@ import (
 	"time"
 )
 
-// rateSampleWindow bounds how far back a per-peer rate calculation looks - long enough that a second or two of jitter doesn't flip
-// a choking decision, short enough that a peer's current behaviour, not how the download started, drives it. This mirros Progress's
-// own rateWindow, just apllied per peer instead of globally, and named separately since the two could reasonably diverge later.
-const rateSampleWindow = 20 * time.Second
-
 // peerRate holds one peer's download and upload byte-count history, each its own rolling window - the same fixed-window, moving-average
 // approach as Progress.recordSample/Rate, doubled for both directions.
 type peerRate struct {
