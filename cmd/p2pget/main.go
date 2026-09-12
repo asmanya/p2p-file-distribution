@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/asmanya/p2p-file-distribution/internal/download"
 	"github.com/asmanya/p2p-file-distribution/internal/metainfo"
@@ -42,7 +45,16 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
-	if err := run(*torrentPath, *outDir, *port, *maxPeers, *seed); err != nil {
+	err = run(*torrentPath, *outDir, *port, *maxPeers, *seed)
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, context.Canceled):
+		// The user asked for this via Ctrl+C (withShutdown cancels the context it hands to Download) - a clean
+		// shutdown they requested, not a failure, so it gets a plain message and a success exit code, not the
+		// "fatal" treatment below.
+		slog.Info("p2pget: stopped")
+	default:
 		slog.Error("p2pget: fatal", "error", err)
 		os.Exit(1)
 	}
@@ -63,7 +75,28 @@ func run(torrentPath, outDir string, port, maxPeers int, seed bool) error {
 
 	tc := tracker.NewClient()
 	opts := download.Options{Port: port, MaxPeers: maxPeers, Seed: seed}
-	return download.Download(context.Background(), tor, tc, peerID, outputPath, opts)
+	return download.Download(withShutdown(), tor, tc, peerID, outputPath, opts)
+}
+
+// withShutdown returns a context that's cancelled on the first SIGINT/SIGTERM, giving Download a chance to shut
+// down cleanly (stop the tracker, sync the file, close every connection) instead of the process just dying
+// mid-write. A second signal forces an immediate exit - if the graceful shutdown is taking a few seconds, a user
+// pressing Ctrl+C again shouldn't be ignored.
+func withShutdown() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		slog.Warn("p2pget: shutting down (press Ctrl+C again to force exit)")
+		cancel()
+		<-sigCh
+		slog.Error("p2pget: forced exit")
+		os.Exit(1)
+	}()
+
+	return ctx
 }
 
 func parseLogLevel(s string) (slog.Level, error) {

@@ -60,6 +60,10 @@ func someUnreachableAddrs(n int) []netip.AddrPort {
 // no goroutines behind - every worker, its cancellation watcher, and any
 // other background goroutine must exit once ctx is cancelled.
 func TestDownloadCleansUpOnCancel(t *testing.T) {
+	oldGrace := shutdownGracePeriod
+	shutdownGracePeriod = 50 * time.Millisecond
+	defer func() { shutdownGracePeriod = oldGrace }()
+
 	tor, _ := loadFixture(t)
 	tor.Announce = fakeTrackerServer(t, someUnreachableAddrs(5))
 	tc := tracker.NewClient()

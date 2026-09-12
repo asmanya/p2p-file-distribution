@@ -5,11 +5,17 @@ import (
 	"log/slog"
 	"net/netip"
 	"runtime/debug"
+	"time"
 
 	"github.com/asmanya/p2p-file-distribution/internal/peer"
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
 	"github.com/asmanya/p2p-file-distribution/internal/storage"
 )
+
+// shutdownGracePeriod is how long Download's main loop keeps servicing resultCh and the tracker after a caller
+// asks it to stop, before it actually force-closes every connection - see the callerDone/shutdownDeadline
+// handling in download.go. A var, not a const, so tests can shrink it instead of waiting out the real duration.
+var shutdownGracePeriod = 5 * time.Second
 
 // SeedConfig groups the read-only state a connection needs to serve incoming block requests: how the torrent is
 // laid out and what we currently have on disk. A connection with a nil SeedConfig never serves requests -

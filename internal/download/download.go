@@ -92,7 +92,7 @@ func (h *HaveBitfield) Count() int {
 //
 // Before requesting anything, it verifies whatever data already exists at outputPath and skips pieces that already match
 // their expected hash - this is the entire resume mechanism, with no separate metadata file.
-func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, peerID [20]byte, outputPath string, opts Options) error {
+func Download(callerCtx context.Context, tor *metainfo.Torrent, tc *tracker.Client, peerID [20]byte, outputPath string, opts Options) error {
 	start := time.Now()
 	pieceCount := tor.PieceCount()
 	progress := NewProgress(pieceCount)
@@ -147,7 +147,11 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 		slog.Info("resume: found existing verified data", "pieces_already_done", completed, "pieces_remaining", pieceCount-completed)
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	// ctx (not callerCtx) is what the coordinator, every worker, and the listener actually watch. It's decoupled
+	// from callerCtx on purpose: the main loop below bridges the two itself, so that a caller-requested shutdown
+	// (an OS signal, typically) gets a grace period serviced normally - resultCh still gets read, pieces still
+	// get written - rather than the coordinator and every connection dying in the same instant the signal arrives.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer tc.Close()
 
@@ -297,14 +301,42 @@ func Download(ctx context.Context, tor *metainfo.Torrent, tc *tracker.Client, pe
 		linesDrawn = 0
 	}
 
+	// callerDone fires the moment callerCtx is cancelled - typically an OS signal caught in cmd/p2pget. From then
+	// on this loop keeps running exactly as before for up to shutdownGracePeriod: resultCh still gets read and
+	// written to disk, the bar still redraws, routine re-announces still fire. callerDone is set to nil once
+	// handled so this branch never fires again (a cancelled context's Done channel stays closed forever, and a
+	// nil channel is never selected) - without that, it would win the select every single time through the loop
+	// from here on. The only other way ctx itself ends up cancelled inside this loop is shutdownDeadline firing
+	// below, so by the time that case runs, callerCtx is always the reason - callerCtx.Err() is what a caller
+	// that cancelled it is expecting back, not ctx.Err() (always context.Canceled, since this function calls its
+	// own cancel() rather than being told to stop by its own parent).
+	var shutdownDeadline <-chan time.Time
+	callerDone := callerCtx.Done()
+
 	for {
 		select {
+		case <-callerDone:
+			callerDone = nil
+			shutdownDeadline = time.After(shutdownGracePeriod)
+			slog.Info("shutting down, giving in-flight pieces a moment to finish", "grace_period", shutdownGracePeriod)
+
+		case <-shutdownDeadline:
+			cancel() // grace period's up - force-close every connection and stop the coordinator now
+
 		case <-ctx.Done():
 			endBlock()
-			cancel()
 			wg.Wait()
+
+			if err := sf.Sync(); err != nil {
+				slog.Warn("download: sync on shutdown failed", "error", err)
+			}
+			slog.Info("shutdown complete",
+				"pieces_done", fmt.Sprintf("%d/%d", completed, pieceCount),
+				"bytes_downloaded", progress.BytesDownloaded(),
+			)
+
 			if !downloadComplete {
-				return ctx.Err()
+				return callerCtx.Err()
 			}
 			return nil
 

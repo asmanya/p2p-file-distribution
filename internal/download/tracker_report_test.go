@@ -50,6 +50,10 @@ func recordingTrackerServer(t *testing.T, addrs []netip.AddrPort) (trackerURL st
 // started with left=full size, a completed announce once every piece is in with left=0, and stopped once the
 // session shuts down.
 func TestDownloadReportsTrackerEvents(t *testing.T) {
+	oldGrace := shutdownGracePeriod
+	shutdownGracePeriod = 50 * time.Millisecond
+	defer func() { shutdownGracePeriod = oldGrace }()
+
 	tor, data := loadFixture(t)
 	addrs := []netip.AddrPort{
 		startSwarmSeeder(t, tor, data, swarmBehavior{}),

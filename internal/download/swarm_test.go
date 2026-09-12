@@ -152,6 +152,10 @@ func runSwarmSeeder(t *testing.T, conn net.Conn, tor *metainfo.Torrent, data []b
 // file exactly: the two healthy seeders are enough to cover every piece the
 // unreliable ones fail to deliver.
 func TestDownloadLocalSwarm(t *testing.T) {
+	oldGrace := shutdownGracePeriod
+	shutdownGracePeriod = 50 * time.Millisecond
+	defer func() { shutdownGracePeriod = oldGrace }()
+
 	tor, data := loadFixture(t)
 
 	addrs := []netip.AddrPort{
