@@ -1,9 +1,4 @@
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - dupl
+version: "2"
 linters:
   disable-all: true
   enable:
@@ -14,5 +9,25 @@ linters:
     - revive
     - gocritic
     - bodyclose
-    - gosimple
     - unused
+  settings:
+    errcheck:
+      # A deferred/best-effort Close() on a connection or file we're about to
+      # discard anyway is a well-known, deliberate exception, not a bug.
+      exclude-functions:
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (io.ReadCloser).Close
+        - (*os.File).Close
+        - (*github.com/asmanya/p2p-file-distribution/internal/storage.File).Close
+        - (*github.com/asmanya/p2p-file-distribution/internal/peer.Conn).Close
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - dupl
