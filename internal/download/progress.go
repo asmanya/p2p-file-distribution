@@ -16,6 +16,7 @@ type Progress struct {
 	PieceCount int
 
 	bytesDownloaded int64 // atomic
+	bytesUploaded   int64 // atomic
 	activePeers     int64 // atomic
 	peakPeers       int64 // atomic - highest activePeers has ever reached
 
@@ -55,6 +56,23 @@ func (p *Progress) BytesDownloaded() int64 {
 		return 0
 	}
 	return atomic.LoadInt64(&p.bytesDownloaded)
+}
+
+// AddUploadedBytes records n more bytes sent to peers we're seeding to - the counterpart to AddBytes for the upload direction.
+// Safe to call from any goroutine, and safe on a nil *Progress.
+func (p *Progress) AddUploadedBytes(n int) {
+	if p == nil {
+		return
+	}
+	atomic.AddInt64(&p.bytesUploaded, int64(n))
+}
+
+// BytesUploaded returns the current total. Safe to call concurrently.
+func (p *Progress) BytesUploaded() int64 {
+	if p == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&p.bytesUploaded)
 }
 
 // PeerConnected/PeerDisconnected track how many workers currently have a live connection. Called from worker

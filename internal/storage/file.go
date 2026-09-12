@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/asmanya/p2p-file-distribution/internal/piece"
@@ -57,4 +58,22 @@ func (sf *File) ReadPiece(index, pieceCount int, pieceLength, totalLength int64)
 // resume's hash verification means a crash before this only costs a re-download of unflushed pieces, not correctness.)
 func (sf *File) Sync() error {
 	return sf.f.Sync()
+}
+
+// ReadBlock reads length bytes starting at begin within piece index - used to serve one block request without reading the whole piece
+// just to slice a fraction of it back out.
+func (sf *File) ReadBlock(index, pieceCount int, pieceLength, totalLength, begin, length int64) ([]byte, error) {
+	start, end, err := piece.Range(index, pieceCount, pieceLength, totalLength)
+	if err != nil {
+		return nil, err
+	}
+	if begin < 0 || begin+length > end-start {
+		return nil, fmt.Errorf("storage: block [%d, %d) exceeds piece length %d", begin, begin+length, end-start)
+	}
+	buf := make([]byte, length)
+	if _, err := sf.f.ReadAt(buf, start+begin); err != nil {
+		return nil, err
+	}
+
+	return buf, nil
 }

@@ -51,3 +51,12 @@ func (c *Conn) SendRequest(index, begin, length int) error {
 	binary.BigEndian.PutUint32(payload[8:12], uint32(length))
 	return c.send(Message{ID: MsgRequest, Payload: payload})
 }
+
+// SendPiece sends a block of piece data back to a peer that requested it.
+func (c *Conn) SendPiece(index, begin int, block []byte) error {
+	payload := make([]byte, 8+len(block))
+	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
+	binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
+	copy(payload[8:], block)
+	return c.send(Message{ID: MsgPiece, Payload: payload})
+}
