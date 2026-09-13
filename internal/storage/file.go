@@ -26,6 +26,7 @@ func Create(path string, totalLength int64) (*File, error) {
 	return &File{f: f}, nil
 }
 
+// Close closes the underlying file.
 func (sf *File) Close() error {
 	return sf.f.Close()
 }

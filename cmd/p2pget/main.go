@@ -1,3 +1,6 @@
+// Command p2pget is a BitTorrent v1 client: point it at a .torrent file and it downloads (and optionally seeds)
+// the file it describes. This file is deliberately thin - flags in, an Options struct, one call into
+// internal/download - with no logic of its own worth unit-testing.
 package main
 
 import (

@@ -57,6 +57,9 @@ func (c *Conn) SetReadDeadline(d time.Duration) error {
 	return nil
 }
 
+// SetWriteDeadline sets a deadline d from now on the underlying connection's writes, mirroring SetReadDeadline for
+// the write direction - the reader and the connection's own writer run on different goroutines sharing one
+// net.Conn, so a single combined deadline would let one direction's timeout silently cut the other short.
 func (c *Conn) SetWriteDeadline(d time.Duration) error {
 	if err := c.conn.SetWriteDeadline(time.Now().Add(d)); err != nil {
 		return fmt.Errorf("peer: set write deadline: %w", err)

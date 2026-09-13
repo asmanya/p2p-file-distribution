@@ -13,6 +13,9 @@ const dialTimeout = 5 * time.Second // cap on establishing the TCP connection it
 // instead of waiting out the real 5s deadline.
 var handshakeTimeout = 5 * time.Second // cap on the whole handshake exchange, once connected
 
+// Sentinel errors distinguishing why a dial or handshake failed, rather than one generic error - most
+// tracker-returned addresses are simply dead or unreachable, and telling that apart from a real protocol bug
+// matters. Use errors.Is to check for a specific one.
 var (
 	ErrHandshakeTimeout = errors.New("peer: handshake timeout")
 	ErrProtocolMismatch = errors.New("peer: protocol mismatch")

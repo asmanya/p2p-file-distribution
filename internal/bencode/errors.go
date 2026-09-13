@@ -2,6 +2,7 @@ package bencode
 
 import "errors"
 
+// Sentinel errors returned by the decoder and by Value accessors. Use errors.Is to check for a specific one.
 var (
 	ErrUnexpectedEOF     = errors.New("bencode: unexpected end of input")
 	ErrInvalidTypeMarker = errors.New("bencode: invalid type marker")

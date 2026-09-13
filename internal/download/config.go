@@ -12,8 +12,8 @@ import "time"
 
 // backlogLimit is how many block requests stay pipelined in flight for a single piece at once, so round-trip
 // latency overlaps across blocks instead of one request sitting idle while its answer is in transit. 5 is a
-// starting point, not a measured optimum - see docs/architecture.md for the reasoning, and TODO: adaptive backlog
-// based on measured per-peer speed is a natural follow-up.
+// starting point, not a measured optimum - see docs/architecture.md for the reasoning. Adaptive backlog sizing
+// based on measured per-peer speed is a natural follow-up, not yet implemented.
 const backlogLimit = 5
 
 var (

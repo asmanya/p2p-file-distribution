@@ -42,6 +42,7 @@ type rateSample struct {
 	bytes int64
 }
 
+// NewProgress returns a Progress tracker for a download of pieceCount pieces.
 func NewProgress(pieceCount int) *Progress {
 	return &Progress{PieceCount: pieceCount}
 }
@@ -95,8 +96,8 @@ func (p *Progress) BytesUploaded() int64 {
 	return atomic.LoadInt64(&p.bytesUploaded)
 }
 
-// PeerConnected/PeerDisconnected track how many workers currently have a live connection. Called from worker
-// goroutine as they start and exit, hence atomic rather than a plain counter.
+// PeerConnected records one more worker with a live connection, and tracks a new peak if this is the highest
+// concurrent count seen yet. Called from a worker goroutine as it starts, hence atomic rather than a plain counter.
 func (p *Progress) PeerConnected() {
 	if p == nil {
 		return
@@ -113,12 +114,14 @@ func (p *Progress) PeerConnected() {
 	}
 }
 
+// PeerDisconnected records one fewer worker with a live connection. Called from a worker goroutine as it exits.
 func (p *Progress) PeerDisconnected() {
 	if p != nil {
 		atomic.AddInt64(&p.activePeers, -1)
 	}
 }
 
+// ActivePeers returns how many workers currently have a live connection.
 func (p *Progress) ActivePeers() int64 {
 	if p == nil {
 		return 0
@@ -134,15 +137,16 @@ func (p *Progress) PeakPeers() int64 {
 	return atomic.LoadInt64(&p.peakPeers)
 }
 
-// ConnectAttempted/ConnectSucceeded track how many peer dial attempts were made and how many completed a handshake,
-// so the caller can report a connection success rate - tracker-returned peers are commonly 60-80% dead or unreachable,
-// and that's a normal, worth-recording fact about the swarm, not a bug.
+// ConnectAttempted records one more peer dial attempt, so the caller can report a connection success rate -
+// tracker-returned peers are commonly 60-80% dead or unreachable, and that's a normal, worth-recording fact about
+// the swarm, not a bug.
 func (p *Progress) ConnectAttempted() {
 	if p != nil {
 		atomic.AddInt64(&p.connectAttempts, 1)
 	}
 }
 
+// ConnectSucceeded records one more peer dial that completed a handshake.
 func (p *Progress) ConnectSucceeded() {
 	if p != nil {
 		atomic.AddInt64(&p.connectSuccesses, 1)
@@ -164,6 +168,7 @@ func (p *Progress) HashFailed() {
 	}
 }
 
+// HashFailures returns how many pieces have failed SHA-1 verification so far.
 func (p *Progress) HashFailures() int64 {
 	if p == nil {
 		return 0
@@ -179,6 +184,7 @@ func (p *Progress) PanicRecovered() {
 	}
 }
 
+// Panics returns how many worker panics have been recovered so far.
 func (p *Progress) Panics() int64 {
 	if p == nil {
 		return 0
@@ -194,6 +200,8 @@ func (p *Progress) DuplicateAssignment() {
 	}
 }
 
+// DuplicateAssignments returns how many endgame assignments have been cancelled so far because another peer
+// finished the same piece first.
 func (p *Progress) DuplicateAssignments() int64 {
 	if p == nil {
 		return 0
@@ -296,11 +304,11 @@ const (
 )
 
 // Render returns a multi-line, colorized status block: the bar (or a "SEEDING" header) on its own line, followed
-// by a small aligned table of the underlying numbers. Every line starts with an ANSI "clear line" code so
+// by a small aligned table of the underlying numbers. Every line starts with an ANSI clear-line code so
 // re-printing this block in place (see the redraw closure in download.go) never leaves stale characters behind
 // when a line gets shorter than it was on the previous tick.
 func (p *Progress) Render(totalBytes int64, seeding bool) []string {
-	const clear = "\x1b[2K"
+	const clearLine = "\x1b[2K"
 
 	// Blank rows (top, between the header and the table, and bottom) visually separate this block from the plain
 	// slog lines around it (the resume/completion messages) - every row is redrawn every tick regardless of
@@ -313,12 +321,12 @@ func (p *Progress) Render(totalBytes int64, seeding bool) []string {
 		}
 		return []string{
 			"",
-			clear + fmt.Sprintf("%s%sSEEDING%s", ansiBold, ansiGreen, ansiReset),
+			clearLine + fmt.Sprintf("%s%sSEEDING%s", ansiBold, ansiGreen, ansiReset),
 			"",
-			clear + fmt.Sprintf("  %-10s %s%d%s", "Peers", ansiMagenta, p.ActivePeers(), ansiReset),
-			clear + fmt.Sprintf("  %-10s %s%.1f KiB/s%s", "Upload", ansiGreen, p.UploadRate()/1024, ansiReset),
-			clear + fmt.Sprintf("  %-10s %.1f MiB", "Uploaded", float64(uploaded)/(1024*1024)),
-			clear + fmt.Sprintf("  %-10s %s%.2f%s", "Ratio", ansiYellow, ratio, ansiReset),
+			clearLine + fmt.Sprintf("  %-10s %s%d%s", "Peers", ansiMagenta, p.ActivePeers(), ansiReset),
+			clearLine + fmt.Sprintf("  %-10s %s%.1f KiB/s%s", "Upload", ansiGreen, p.UploadRate()/1024, ansiReset),
+			clearLine + fmt.Sprintf("  %-10s %.1f MiB", "Uploaded", float64(uploaded)/(1024*1024)),
+			clearLine + fmt.Sprintf("  %-10s %s%.2f%s", "Ratio", ansiYellow, ratio, ansiReset),
 			"",
 		}
 	}
@@ -332,12 +340,12 @@ func (p *Progress) Render(totalBytes int64, seeding bool) []string {
 
 	return []string{
 		"",
-		clear + fmt.Sprintf("[%s] %s%5.1f%%%s", bar, ansiBold, p.Percent(), ansiReset),
+		clearLine + fmt.Sprintf("[%s] %s%5.1f%%%s", bar, ansiBold, p.Percent(), ansiReset),
 		"",
-		clear + fmt.Sprintf("  %-10s %d/%d", "Pieces", p.piecesDone, p.PieceCount),
-		clear + fmt.Sprintf("  %-10s %s%.1f KiB/s%s", "Speed", ansiCyan, p.Rate()/1024, ansiReset),
-		clear + fmt.Sprintf("  %-10s %s%d%s", "Peers", ansiMagenta, p.ActivePeers(), ansiReset),
-		clear + fmt.Sprintf("  %-10s %s%s%s", "ETA", ansiYellow, p.ETA(totalBytes).Round(time.Second), ansiReset),
+		clearLine + fmt.Sprintf("  %-10s %d/%d", "Pieces", p.piecesDone, p.PieceCount),
+		clearLine + fmt.Sprintf("  %-10s %s%.1f KiB/s%s", "Speed", ansiCyan, p.Rate()/1024, ansiReset),
+		clearLine + fmt.Sprintf("  %-10s %s%d%s", "Peers", ansiMagenta, p.ActivePeers(), ansiReset),
+		clearLine + fmt.Sprintf("  %-10s %s%s%s", "ETA", ansiYellow, p.ETA(totalBytes).Round(time.Second), ansiReset),
 		"",
 	}
 }

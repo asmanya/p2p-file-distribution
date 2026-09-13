@@ -128,3 +128,72 @@ func TestWritePieceConcurrentDifferentIndices(t *testing.T) {
 		t.Error("final file bytes don't match expected data")
 	}
 }
+
+// TestSync confirms Sync doesn't error on a real, open file - it's a thin wrapper over os.File.Sync, but it's the
+// call every completed or gracefully-shutdown download depends on to actually get bytes onto disk.
+func TestSync(t *testing.T) {
+	data, pieceCount, pieceLength, totalLength, _ := testFixture(t)
+	path := filepath.Join(t.TempDir(), "out.dat")
+
+	sf, err := Create(path, totalLength)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer sf.Close()
+
+	start, end, err := piece.Range(0, pieceCount, pieceLength, totalLength)
+	if err != nil {
+		t.Fatalf("piece.Range: %v", err)
+	}
+	if err := sf.WritePiece(0, pieceCount, pieceLength, totalLength, data[start:end]); err != nil {
+		t.Fatalf("WritePiece: %v", err)
+	}
+	if err := sf.Sync(); err != nil {
+		t.Errorf("Sync: %v", err)
+	}
+}
+
+// TestReadBlock covers the seeding path: reading one block out of a piece without reading the whole piece, plus
+// the bounds check that keeps a peer's request from reading past its own piece into the next one.
+func TestReadBlock(t *testing.T) {
+	data, pieceCount, pieceLength, totalLength, _ := testFixture(t)
+	path := filepath.Join(t.TempDir(), "out.dat")
+
+	sf, err := Create(path, totalLength)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer sf.Close()
+
+	start, end, err := piece.Range(0, pieceCount, pieceLength, totalLength)
+	if err != nil {
+		t.Fatalf("piece.Range: %v", err)
+	}
+	pieceData := data[start:end]
+	if err := sf.WritePiece(0, pieceCount, pieceLength, totalLength, pieceData); err != nil {
+		t.Fatalf("WritePiece: %v", err)
+	}
+
+	t.Run("valid block", func(t *testing.T) {
+		got, err := sf.ReadBlock(0, pieceCount, pieceLength, totalLength, 2, 3)
+		if err != nil {
+			t.Fatalf("ReadBlock: %v", err)
+		}
+		if !bytes.Equal(got, pieceData[2:5]) {
+			t.Errorf("ReadBlock(2,3) = %v, want %v", got, pieceData[2:5])
+		}
+	})
+
+	t.Run("negative begin rejected", func(t *testing.T) {
+		if _, err := sf.ReadBlock(0, pieceCount, pieceLength, totalLength, -1, 3); err == nil {
+			t.Error("expected an error for a negative begin, got nil")
+		}
+	})
+
+	t.Run("block overrunning the piece rejected", func(t *testing.T) {
+		pieceLen := end - start
+		if _, err := sf.ReadBlock(0, pieceCount, pieceLength, totalLength, pieceLen-1, 10); err == nil {
+			t.Error("expected an error for a block that overruns the piece, got nil")
+		}
+	})
+}

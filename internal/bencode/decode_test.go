@@ -200,3 +200,55 @@ func TestDecodeStrict(t *testing.T) {
 		})
 	}
 }
+
+// TestDecodeWithSpans is the direct test for the one thing metainfo's dual info-hash computation depends on: that
+// the returned span for a key is the exact byte range its value occupies in the original input, so re-slicing the
+// input at that range and hashing it gives the same bytes a decode-then-re-encode round trip would.
+func TestDecodeWithSpans(t *testing.T) {
+	input := "d3:bar4:spam3:fooi42ee"
+	d := NewDecoder(strings.NewReader(input))
+	dict, spans, err := d.DecodeWithSpans()
+	if err != nil {
+		t.Fatalf("DecodeWithSpans: %v", err)
+	}
+
+	if len(dict) != 2 {
+		t.Fatalf("got %d keys, want 2", len(dict))
+	}
+
+	barSpan, ok := spans["bar"]
+	if !ok {
+		t.Fatal("missing span for key \"bar\"")
+	}
+	if got := input[barSpan.Start:barSpan.End]; got != "4:spam" {
+		t.Errorf("bar span = %q, want %q", got, "4:spam")
+	}
+
+	fooSpan, ok := spans["foo"]
+	if !ok {
+		t.Fatal("missing span for key \"foo\"")
+	}
+	if got := input[fooSpan.Start:fooSpan.End]; got != "i42e" {
+		t.Errorf("foo span = %q, want %q", got, "i42e")
+	}
+}
+
+func TestDecodeWithSpansRejectsNonDictionary(t *testing.T) {
+	d := NewDecoder(strings.NewReader("i42e"))
+	if _, _, err := d.DecodeWithSpans(); err == nil {
+		t.Error("expected an error decoding a non-dictionary top level value, got nil")
+	}
+}
+
+func TestAtEnd(t *testing.T) {
+	d := NewDecoder(strings.NewReader("i42e"))
+	if d.AtEnd() {
+		t.Fatal("AtEnd() = true before anything was read")
+	}
+	if _, err := d.Decode(); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if !d.AtEnd() {
+		t.Error("AtEnd() = false after consuming all input")
+	}
+}

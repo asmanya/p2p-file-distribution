@@ -2,6 +2,7 @@ package piece
 
 import "fmt"
 
+// BlockSize is the de-facto standard request size used by this client and expected by real peers.
 const BlockSize = 16 * 1024
 
 // Length returns the actual length of piece index, given the torrent's total length and standard piece length. Every

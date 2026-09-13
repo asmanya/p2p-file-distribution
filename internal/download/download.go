@@ -36,16 +36,19 @@ type HaveBitfield struct {
 	bf peer.Bitfield
 }
 
+// NewHaveBitfield returns a HaveBitfield sized for pieceCount, with every piece initially missing.
 func NewHaveBitfield(pieceCount int) *HaveBitfield {
 	return &HaveBitfield{bf: make(peer.Bitfield, (pieceCount+7)/8)}
 }
 
+// Set marks index as verified and on disk.
 func (h *HaveBitfield) Set(index int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.bf.SetPiece(index)
 }
 
+// Has reports whether index is verified and on disk.
 func (h *HaveBitfield) Has(index int) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()

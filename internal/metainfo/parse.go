@@ -127,7 +127,7 @@ func parseInfo(info bencode.Dictionary, t *Torrent) error {
 
 	length, err := info.GetInt("length")
 	if err != nil {
-		return fmt.Errorf("metainfo: missing info.length (multi-file torrents not yet supported): %W", err)
+		return fmt.Errorf("metainfo: missing info.length (multi-file torrents not yet supported): %w", err)
 	}
 	t.TotalLength = length
 	t.Files = []FileEntry{{Path: t.Name, Length: t.TotalLength}}

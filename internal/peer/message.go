@@ -9,6 +9,7 @@ import (
 // MessageID identifies a peer wire message's type
 type MessageID int8
 
+// Message IDs, per the BitTorrent wire protocol spec.
 const (
 	MsgKeepAlive     MessageID = -1 // sentinel: does not exist on the wire, length-0 messages map here
 	MsgChoke         MessageID = 0
