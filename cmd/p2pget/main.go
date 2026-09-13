@@ -18,7 +18,7 @@ import (
 	"github.com/asmanya/p2p-file-distribution/internal/tracker"
 )
 
-const version = "0.1.0"
+const version = "1.0.1"
 
 func main() {
 	torrentPath := flag.String("torrent", "", "path to the .torrent file (required)")
